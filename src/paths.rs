@@ -119,6 +119,28 @@ impl AppDirs {
             .unwrap_or_else(|| self.media_cache_dir())
     }
 
+    /// Returns true if `path` resolves to the default media cache directory.
+    pub fn is_default_media_dir(&self, path: &Path) -> bool {
+        let default = self.media_cache_dir();
+        match (path.canonicalize(), default.canonicalize()) {
+            (Ok(p), Ok(d)) => p == d,
+            _ => path == default,
+        }
+    }
+
+    /// Returns true if `path` is equal to or contained within `self.cache`.
+    pub fn is_cache_path(&self, path: &Path) -> bool {
+        Self::is_subpath(path, &self.cache)
+    }
+
+    /// Checks whether `child` is equal to or located within `parent`.
+    pub fn is_subpath(child: &Path, parent: &Path) -> bool {
+        match (child.canonicalize(), parent.canonicalize()) {
+            (Ok(c), Ok(p)) => c.starts_with(&p),
+            _ => child.starts_with(parent),
+        }
+    }
+
     /// Profile pictures keyed by chat.
     pub fn avatar_cache_dir(&self) -> PathBuf {
         self.cache.join("avatars")
@@ -345,6 +367,20 @@ mod tests {
         let custom = root.join("my-custom-media");
         dirs.custom_media = Some(custom.clone());
         assert_eq!(dirs.media_dir(), custom);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_path_detection_identifies_subpaths() {
+        let root = root("cache-detection");
+        let dirs = AppDirs::under(&root);
+        dirs.ensure().unwrap();
+
+        assert!(dirs.is_default_media_dir(&dirs.media_cache_dir()));
+        assert!(dirs.is_cache_path(&dirs.media_cache_dir()));
+        assert!(dirs.is_cache_path(&dirs.media_cache_dir().join("subfolder")));
+        assert!(!dirs.is_cache_path(&root.join("external-downloads")));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

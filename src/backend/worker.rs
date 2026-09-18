@@ -1356,11 +1356,35 @@ impl Worker {
             let _ = std::fs::remove_file(path);
         }
         let _ = std::fs::remove_dir_all(self.dirs.avatar_cache_dir());
-        let _ = std::fs::remove_dir_all(self.dirs.media_cache_dir());
+        self.clean_media_cache();
         self.emit(Event::Chats(Vec::new()));
         self.set_status(LinkStatus::LoggedOut);
         // Recreate the store so the next connection starts linking.
         self.start_bot().await;
+    }
+
+    /// Cleans the media cache directory on logout without removing any configured custom media subtree.
+    fn clean_media_cache(&self) {
+        let media_cache = self.dirs.media_cache_dir();
+        if let Some(custom) = &self.dirs.custom_media
+            && AppDirs::is_subpath(custom, &media_cache)
+        {
+            if let Ok(entries) = std::fs::read_dir(&media_cache) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if AppDirs::is_subpath(custom, &path) {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        let _ = std::fs::remove_dir_all(&path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            return;
+        }
+        let _ = std::fs::remove_dir_all(media_cache);
     }
 
     fn on_contact_update(&mut self, update: &wa_events::ContactUpdate) {
@@ -2585,6 +2609,19 @@ impl Worker {
                 });
             }
             Command::SetMediaDir(dir) => {
+                if self.dirs.is_default_media_dir(&dir) {
+                    self.dirs.custom_media = None;
+                    self.relocate_media();
+                    self.emit(Event::MediaDirChanged(None));
+                    return;
+                }
+                if self.dirs.is_cache_path(&dir) {
+                    self.emit(Event::Error(
+                        "Custom attachment folder cannot be inside the cache directory".to_owned(),
+                    ));
+                    return;
+                }
+                let _ = std::fs::create_dir_all(&dir);
                 self.dirs.custom_media = Some(dir.clone());
                 self.relocate_media();
                 self.emit(Event::MediaDirChanged(Some(dir)));

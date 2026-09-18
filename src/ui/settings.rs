@@ -198,7 +198,6 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         &media.display().to_string(),
                         |ui| {
                             if theme::soft_button(ui, &palette, Some(Icon::ExternalLink), "Open folder", false).clicked() {
-                                let _ = std::fs::create_dir_all(&media);
                                 app.actions.push(Action::OpenFile(media.clone()));
                             }
                             if theme::soft_button(ui, &palette, Some(Icon::Pencil), "Change", false).clicked() {

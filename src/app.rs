@@ -3580,7 +3580,47 @@ mod name_tests {
         assert_eq!(app.dirs.custom_media, None);
         assert_eq!(app.settings.custom_media_dir, None);
 
-        let custom = std::path::PathBuf::from("/custom/download/folder");
+        let chat = "15550001111@s.whatsapp.net";
+        let old_missing = directory.path().join("old_cache/photo.jpg");
+        let message = Message {
+            id: "m_img".into(),
+            chat: chat.into(),
+            sender: chat.into(),
+            sender_name: None,
+            from_me: false,
+            timestamp: 0,
+            content: Content::Image {
+                caption: None,
+                media: Media {
+                    mime: "image/jpeg".into(),
+                    size: 100,
+                    width: None,
+                    height: None,
+                    path: Some(old_missing),
+                    state: MediaState::Idle,
+                },
+            },
+            status: Delivery::None,
+            delivered_at: None,
+            read_at: None,
+            quoted: None,
+            reactions: Vec::new(),
+            edited: false,
+            mentions: Vec::new(),
+            forwarded: false,
+            thumbnail: None,
+        };
+        let conversation = Conversation {
+            messages: vec![message],
+            ..Default::default()
+        };
+        app.conversations.insert(chat.into(), conversation);
+
+        let custom = directory.path().join("custom_downloads");
+        std::fs::create_dir_all(&custom).unwrap();
+        let replacement = custom.join("photo.jpg");
+        std::fs::write(&replacement, b"image payload").unwrap();
+
         events
             .send(Event::MediaDirChanged(Some(custom.clone())))
             .unwrap();
@@ -3588,6 +3628,15 @@ mod name_tests {
         assert_eq!(app.dirs.custom_media, Some(custom.clone()));
         assert_eq!(app.settings.custom_media_dir, Some(custom));
         assert!(app.settings_dirty);
+
+        let repaired = app.conversations.get(chat).unwrap();
+        assert_eq!(
+            repaired.messages[0]
+                .content
+                .media()
+                .and_then(|m| m.path.as_ref()),
+            Some(&replacement)
+        );
 
         events.send(Event::MediaDirChanged(None)).unwrap();
         app.background_frame(&ctx);
