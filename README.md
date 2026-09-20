@@ -155,9 +155,10 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   unavailable; reconnect the storage or restore missing custom files before retrying.
   This also protects files
   when an unmounted drive leaves an empty, readable mount point. Missing files in
-  the default cache can still be cleared for redownload.
+the default cache can still be cleared for redownload.
   **Reset** uses the default cache again. Custom folders must be outside the app's
-  cache. Unlinking removes this device and clears cache files while preserving
+  cache and data folders (the archive, session store, logs, and settings live
+  there). Unlinking removes this device and clears cache files while preserving
   custom folders and the attachments copied there.
 
 ## What it does not do yet

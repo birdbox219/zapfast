@@ -132,6 +132,15 @@ impl Worker {
                     "Custom attachment folder cannot be inside the cache directory",
                 ));
             }
+            if custom.is_some()
+                && (AppDirs::is_subpath(&dir, &dirs.state)
+                    || AppDirs::is_subpath(&dir, &dirs.config))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Custom attachment folder cannot be inside the app data folders",
+                ));
+            }
             let custom = custom.map(|_| dir.clone());
             // Even an empty archive must not accept an unwritable directory.
             let _probe = tempfile::NamedTempFile::new_in(&dir)?;
@@ -468,6 +477,27 @@ mod tests {
 
         worker.relocate_media();
         assert_eq!(archived_path(&worker, "image"), Some(source));
+        assert_eq!(std::fs::read(decoy).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn startup_never_adopts_a_same_named_file_in_the_custom_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut worker, _events, _commands, _wa) = super::super::receipt_tests::worker();
+        worker.dirs = AppDirs::under(root.path());
+        let cache = worker.dirs.ensure_media_dir().unwrap();
+        // A stale default-cache row that vanished after an interrupted change.
+        let stale = cache.join("photo.jpg");
+        attachment(&worker, "image", &stale);
+        let custom = root.path().join("downloads");
+        std::fs::create_dir_all(&custom).unwrap();
+        // An unrelated file in the user's folder with the exact same name.
+        let decoy = custom.join("photo.jpg");
+        std::fs::write(&decoy, b"unrelated").unwrap();
+        worker.dirs.custom_media = Some(custom.clone());
+
+        worker.relocate_media();
+        assert_eq!(archived_path(&worker, "image"), None);
         assert_eq!(std::fs::read(decoy).unwrap(), b"unrelated");
     }
 

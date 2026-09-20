@@ -518,6 +518,10 @@ impl Worker {
             log::warn!("attachment folder unavailable; keeping archived paths");
             return;
         }
+        // A same-named file is evidence of identity only inside the cache the
+        // app itself manages. A custom folder is user-controlled, so a file
+        // there with a matching name must never be adopted by inference.
+        let cache = self.dirs.media_cache_dir();
         let rows = match self.archive.media_paths() {
             Ok(rows) => rows,
             Err(error) => {
@@ -534,7 +538,7 @@ impl Worker {
             {
                 continue;
             }
-            let candidate = path.file_name().map(|name| dir.join(name));
+            let candidate = path.file_name().map(|name| cache.join(name));
             match candidate.as_ref().map(|candidate| candidate.try_exists()) {
                 Some(Ok(true)) => {
                     let candidate = candidate.unwrap();
@@ -553,7 +557,7 @@ impl Worker {
         if moved + forgotten > 0 {
             log::info!(
                 "attachments: {moved} re-pointed to {}, {forgotten} to fetch again",
-                dir.display()
+                cache.display()
             );
         }
     }
