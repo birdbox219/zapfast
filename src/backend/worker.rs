@@ -1369,6 +1369,9 @@ impl Worker {
         if let Some(custom) = &self.dirs.custom_media
             && AppDirs::is_subpath(&media_cache, custom)
         {
+            if !AppDirs::is_subpath(custom, &media_cache) {
+                let _ = std::fs::remove_dir_all(&media_cache);
+            }
             return;
         }
         if let Some(custom) = &self.dirs.custom_media
