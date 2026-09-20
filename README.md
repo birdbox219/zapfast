@@ -25,6 +25,8 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   Recent history is copied to this computer after linking and stored here.
 - **Chats.** See pinned, unread, muted, and archived chats, typing indicators,
   and message status. Search chats, saved messages, and contacts.
+  Filter the list to unread, private (one-to-one), or group chats with the
+  chips under the search bar; a chip with unread chats shows how many it has.
   Pinned chats stay in pin order (most recently pinned first), regardless of
   new messages. Chat and contact name searches ignore accents, so `Angel`
   finds `Ángel`.
@@ -45,8 +47,10 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
 - **WhatsApp formatting.** Bold, italic, strikethrough, code, lists, quotes,
   mentions, and link previews are supported. Links are clickable. Hebrew and
   Arabic RTL paragraphs keep logical word order by reordering font runs; this
-  is not a full Unicode Bidirectional Algorithm. Emoji use the desktop's
-  color emoji font, with a bundled fallback, and emoji-only messages are larger.
+  is not a full Unicode Bidirectional Algorithm. Emoji use the bundled Noto
+  Color Emoji on macOS and Windows. On Linux, ZapFast prefers an installed
+  Noto Color Emoji and falls back to the bundled copy. Emoji-only messages
+  are larger.
 - **Send attachments with captions.** Paste a picture, drop files, or use the
   file picker. They stay in the composer until you send them or press Escape.
 - **Mute chats** for eight hours, one week, or indefinitely. The setting also
@@ -55,7 +59,9 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   Existing installations request one settings refresh after upgrading to
   recover previously lost mute settings and pin order, without relinking.
 - **Voice messages.** Play, seek, record, reply with, and send voice messages
-  in the chat. The app normalizes quiet recordings and handles OGG/Opus
+  in the chat. The playback speed cycles between 1x, 1.5x, and 2x from the
+  bubble, keeping the speaker's pitch, and the last choice applies to later
+  messages. The app normalizes quiet recordings and handles OGG/Opus
   without external tools.
 - **Send messages.** Press Enter to send text and Shift+Enter for a new line.
   You can swap these keys in Settings. The composer is focused when you open
@@ -250,7 +256,9 @@ WhatsApp then sends your recent history. This can take a few minutes. A banner
 shows the progress. New messages arrive live, and your phone does not need to
 stay on the same network.
 
-Right-click a chat or message to open its menu. Open Settings from the gear or
+Right-click a chat or message to open its menu. Double-click beside a message,
+or on its edge, to reply to it (a double-click on its text still selects the
+word). Open Settings from the gear or
 with `Ctrl+,`. Use the pencil to message a new number or save a contact. You
 can also open a group member's contact card. Saved names sync through WhatsApp
 to your phone and linked devices.
@@ -283,7 +291,8 @@ logs or databases. Windows uses the permissions inherited from your user profile
 
 **Settings → Appearance → Theme** uses the same picker as Spotifast, with
 Follow system, Light, Dark, and its Catppuccin, Catppuccin Latte, Nord, Ristretto,
-and Tokyo Night palettes. Choose **Open themes folder** below the picker to add
+Tokyo Night, Rose Pine, Rose Pine Moon, and Rose Pine Dawn palettes.
+Choose **Open themes folder** below the picker to add
 JSON palettes beside `settings.json`. A local file with a bundled palette's name
 overrides it. For example:
 

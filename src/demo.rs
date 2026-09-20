@@ -1142,6 +1142,9 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.composer = "Look at these".into();
             }
             "archived" => app.show_archived = true,
+            "unread" => app.chat_filter = crate::model::ChatFilter::Unread,
+            "private" => app.chat_filter = crate::model::ChatFilter::Private,
+            "groups" => app.chat_filter = crate::model::ChatFilter::Groups,
             "picker" => app.picker = Some(crate::model::PickerTab::Emoji),
             "stickers" => {
                 app.picker = Some(crate::model::PickerTab::Stickers);
@@ -1366,6 +1369,9 @@ mod tests {
             "theme=Catppuccin Latte.json",
             "theme=Nord.json",
             "theme=Ristretto.json",
+            "theme=Rose Pine.json",
+            "theme=Rose Pine Moon.json",
+            "theme=Rose Pine Dawn.json",
             "theme=Tokyo Night.json",
             "shortcuts",
             "about",
@@ -1375,6 +1381,9 @@ mod tests {
             "new-contact",
             "light",
             "archived",
+            "unread",
+            "private",
+            "groups",
             "offline",
             "syncing",
             "picker",
@@ -1826,6 +1835,89 @@ mod tests {
     }
 
     #[test]
+    fn a_filter_chip_narrows_the_chat_list_and_a_second_click_clears_it() {
+        use crate::model::ChatFilter;
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        let everything = app.visible_chats().len();
+        let click = |app: &mut App, filter| {
+            let rect = ctx
+                .data(|data| data.get_temp::<egui::Rect>(crate::ui::chats::filter_chip_id(filter)))
+                .expect("the chip is on screen");
+            let pos = rect.center();
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(app, &ctx, vec![egui::Event::PointerMoved(pos), press(true)]);
+            frame_with(app, &ctx, vec![press(false)]);
+            render(app, &ctx);
+        };
+        click(&mut app, ChatFilter::Groups);
+        assert_eq!(app.chat_filter, ChatFilter::Groups);
+        let groups = app.visible_chats();
+        assert!(!groups.is_empty() && groups.len() < everything);
+        assert!(groups.iter().all(|chat| chat.is_group()));
+        click(&mut app, ChatFilter::Groups);
+        assert_eq!(app.chat_filter, ChatFilter::All);
+        assert_eq!(app.visible_chats().len(), everything);
+    }
+
+    #[test]
+    fn a_chat_clicked_in_the_unread_list_stays_there_once_read() {
+        use crate::model::ChatFilter;
+        let mut app = app();
+        app.chat_filter = ChatFilter::Unread;
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        let listed: Vec<String> = app
+            .visible_chats()
+            .iter()
+            .map(|chat| chat.id.clone())
+            .collect();
+        assert!(listed.len() >= 2, "the sample has several unread chats");
+        for id in &listed {
+            let rect = ctx
+                .data(|data| data.get_temp::<egui::Rect>(crate::ui::chats::chat_row_id(id)))
+                .expect("the row is on screen");
+            let pos = rect.center();
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(pos), press(true)],
+            );
+            frame_with(&mut app, &ctx, vec![press(false)]);
+            assert_eq!(app.open_chat.as_deref(), Some(id.as_str()));
+            // The headless window may not read the chat; read it here.
+            for chat in &mut app.chats {
+                if chat.id == *id {
+                    chat.unread = 0;
+                }
+            }
+            render(&mut app, &ctx);
+        }
+        let after: Vec<String> = app
+            .visible_chats()
+            .iter()
+            .map(|chat| chat.id.clone())
+            .collect();
+        assert_eq!(after, listed, "every opened chat is still listed");
+    }
+
+    #[test]
     fn bubble_hit_rects_follow_the_layout() {
         // Ensure the right-click rect follows messages after initial scrolling.
         let mut app = app();
@@ -2115,6 +2207,80 @@ mod tests {
         for text in ["Left first", "Right second", "Left last"] {
             assert!(copied.contains(text), "{copied:?}");
         }
+    }
+
+    /// Opens a chat with one text and one deleted message, double-clicks the
+    /// point chosen from the named bubble's rect and its body, and returns the
+    /// message being replied to.
+    fn reply_after_double_click(
+        id: &str,
+        point: impl Fn(egui::Rect, Option<egui::Rect>) -> egui::Pos2,
+    ) -> Option<String> {
+        let mut app = app();
+        let chat = sample_ids()[0].to_owned();
+        app.conversations.get_mut(&chat).unwrap().messages = vec![
+            message(&chat, "text", false, 100, Content::text("Double-click me")),
+            message(&chat, "gone", false, 200, Content::Revoked),
+        ];
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        for _ in 0..3 {
+            render(&mut app, &ctx);
+        }
+        let key = crate::ui::conversation::bubble_id(&chat, id);
+        let rect = ctx
+            .data(|data| data.get_temp::<egui::Rect>(key.with("rect")))
+            .expect("the bubble is on screen");
+        let body = ctx.data(|data| data.get_temp::<egui::Rect>(key.with("body")));
+        let pos = point(rect, body);
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(pos), press(true)],
+            vec![press(false)],
+            vec![press(true)],
+            vec![press(false)],
+            vec![],
+        ] {
+            frame_with(&mut app, &ctx, events);
+        }
+        app.reply_to
+    }
+
+    #[test]
+    fn a_double_click_on_the_bubble_padding_replies() {
+        let reply =
+            reply_after_double_click("text", |rect, _| rect.left_center() + egui::vec2(4.0, 0.0));
+        assert_eq!(reply.as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn a_double_click_beside_the_bubble_replies() {
+        let reply = reply_after_double_click("text", |rect, _| {
+            rect.right_center() + egui::vec2(120.0, 0.0)
+        });
+        assert_eq!(reply.as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn a_double_click_on_the_text_selects_the_word_without_replying() {
+        let reply = reply_after_double_click("text", |_, body| {
+            let body = body.expect("a text body");
+            body.left_center() + egui::vec2(12.0, 0.0)
+        });
+        assert_eq!(reply, None);
+    }
+
+    #[test]
+    fn a_double_click_on_a_deleted_message_does_not_reply() {
+        let reply = reply_after_double_click("gone", |rect, _| {
+            rect.right_center() + egui::vec2(120.0, 0.0)
+        });
+        assert_eq!(reply, None);
     }
 
     /// Selection continues and scrolls after the pointer leaves the window.

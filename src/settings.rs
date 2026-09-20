@@ -74,6 +74,8 @@ pub struct Settings {
     pub download_updates_automatically: bool,
     /// Prefer address-book names over public profile names.
     pub names_from_contacts: bool,
+    /// Voice and audio playback speed multiplier.
+    pub voice_speed: f32,
     /// Also add saved contacts to the phone's address book.
     pub save_contacts_to_phone: bool,
     /// Custom folder for downloaded attachments.
@@ -106,6 +108,7 @@ impl Default for Settings {
             names_from_contacts: true,
             save_contacts_to_phone: true,
             custom_media_dir: None,
+            voice_speed: 1.0,
         }
     }
 }
@@ -200,6 +203,7 @@ mod tests {
             zoom: 1.25,
             enter_sends: false,
             custom_media_dir: Some(PathBuf::from("/custom/media/path")),
+            voice_speed: 1.5,
             ..Settings::default()
         };
         settings.save(&path).expect("saves");
