@@ -62,6 +62,20 @@ mod tests {
     use super::LinkStatus;
 
     #[test]
+    fn backend_waits_for_window_acknowledgement_before_touching_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let dirs = crate::paths::AppDirs::under(directory.path());
+        let mut backend = super::Backend::spawn(dirs.clone(), super::Waker::default());
+        assert!(!dirs.session_db().exists());
+        assert!(!dirs.archive_db().exists());
+        // Closing before a first frame must cancel startup without connecting
+        // or hanging while joining the waiting worker.
+        backend.shutdown();
+        assert!(!dirs.session_db().exists());
+        assert!(!dirs.archive_db().exists());
+    }
+
+    #[test]
     fn link_logs_redact_pairing_credentials() {
         let qr = "qr-payload-that-links-an-account";
         let code = "12345678";
@@ -572,6 +586,7 @@ impl Waker {
 
 /// UI handle to the backend runtime.
 pub struct Backend {
+    startup: Option<tokio::sync::oneshot::Sender<()>>,
     commands: mpsc::UnboundedSender<Command>,
     events: std::sync::mpsc::Receiver<Event>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -591,17 +606,21 @@ impl Backend {
             .build()
             .expect("unable to start the async runtime");
         let worker_commands = command_tx.clone();
+        let (startup, started) = tokio::sync::oneshot::channel();
         let thread = std::thread::Builder::new()
             .name("zapfast-backend".to_string())
             .spawn(move || {
                 runtime.block_on(async move {
-                    worker::run(dirs, event_tx, worker_commands, command_rx, waker).await;
+                    if started.await.is_ok() {
+                        worker::run(dirs, event_tx, worker_commands, command_rx, waker).await;
+                    }
                 });
                 runtime.shutdown_timeout(Duration::from_secs(3));
             })
             .expect("unable to start the backend thread");
 
         Self {
+            startup: Some(startup),
             commands: command_tx,
             events: event_rx,
             thread: Some(thread),
@@ -617,6 +636,7 @@ impl Backend {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         (
             Self {
+                startup: None,
                 commands: command_tx,
                 events: event_rx,
                 thread: None,
@@ -681,7 +701,14 @@ impl Backend {
         self.events.try_iter().collect()
     }
 
+    /// Start database migrations only after the first window frame has been
+    /// acknowledged by the update helper. Dropping this permit cancels startup.
+    pub fn take_startup(&mut self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        self.startup.take()
+    }
+
     pub fn shutdown(&mut self) {
+        self.startup.take();
         self.send(Command::Shutdown);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

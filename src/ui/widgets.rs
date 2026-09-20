@@ -15,6 +15,7 @@ use crate::theme::{self, Icon, Palette};
 pub struct Line {
     pub galley: std::sync::Arc<egui::Galley>,
     placements: Vec<String>,
+    accessible_text: String,
 }
 
 impl Line {
@@ -23,6 +24,19 @@ impl Line {
     }
 
     pub fn paint(&self, ui: &Ui, pos: egui::Pos2, fallback: Color32) {
+        let response = ui.interact(
+            Rect::from_min_size(pos, self.size()),
+            ui.id()
+                .with(("painted-text", pos.x.to_bits(), pos.y.to_bits())),
+            Sense::hover(),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                ui.is_enabled(),
+                &self.accessible_text,
+            )
+        });
         ui.painter().galley(pos, self.galley.clone(), fallback);
         emoji::paint(ui, &self.galley, pos, &self.placements);
     }
@@ -53,7 +67,11 @@ pub fn line(
         &format,
     );
     let galley = bidi::layout_job(ui, job);
-    Line { galley, placements }
+    Line {
+        galley,
+        placements,
+        accessible_text: text.to_owned(),
+    }
 }
 
 /// Allocates one truncated line with color emoji.
@@ -77,6 +95,8 @@ pub fn selectable_rich_text(
     let width = ui.available_width().max(1.0);
     let line = line(ui, text, font, color, width, 1);
     let (rect, response) = ui.allocate_exact_size(line.size(), Sense::click_and_drag());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
     // Register emoji placements so copied text restores the original sequences.
     if let Some(rows) = ui.ctx().data(|data| {
         data.get_temp::<std::sync::Arc<std::sync::Mutex<Vec<crate::transcript::Row>>>>(
@@ -241,6 +261,9 @@ pub fn menu_item_enabled(
             Sense::hover()
         },
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled && ui.is_enabled(), label)
+    });
     if ui.is_rect_visible(rect) {
         if response.hovered() && enabled {
             ui.painter()
@@ -387,6 +410,8 @@ pub fn search_field(
             .desired_width(field_rect.width())
             .vertical_align(Align::Center),
     );
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(hint));
     if !text.is_empty() {
         let clear_rect = Rect::from_center_size(
             pos2(rect.right() - 17.0, rect.center().y),

@@ -8,6 +8,7 @@ pub mod backend;
 pub mod bidi;
 #[cfg(any(test, feature = "demo"))]
 pub mod demo;
+pub mod diagnostics;
 pub mod emoji;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -16,6 +17,7 @@ pub mod model;
 pub mod notify;
 pub mod paths;
 pub mod qr;
+pub mod safety;
 pub mod settings;
 pub mod single_instance;
 pub mod system_fonts;

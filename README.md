@@ -31,6 +31,7 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   new messages. Chat and contact name searches ignore accents, so `Angel`
   finds `Ángel`.
   Typing indicators show other participants, excluding your own linked devices.
+  Newsletter channels are read-only; publishing channel posts is not supported.
 - **Read state across devices.** Reading a chat syncs its unread badge with
   your phone and other linked devices, including when read receipts are off.
   Replies from another device clear preceding unread messages. The read-receipt
@@ -51,6 +52,13 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   Color Emoji on macOS and Windows. On Linux, ZapFast prefers an installed
   Noto Color Emoji and falls back to the bundled copy. Emoji-only messages
   are larger.
+- **Screen-reader access.** AccessKit exposes the interface to desktop
+  accessibility services. Custom buttons, chat rows, settings switches and
+  message text include readable labels. Windows NVDA navigation still needs
+  platform verification; keyboard and screen-reader support is not complete.
+- **Safer desktop opening.** Links open only web pages or email addresses.
+  Common documents and media open in their default apps; executable, script,
+  and unrecognized attachment formats open their containing folder instead.
 - **Send attachments with captions.** Paste a picture, drop files, or use the
   file picker. They stay in the composer until you send them or press Escape.
 - **Mute chats** for eight hours, one week, or indefinitely. The setting also
@@ -222,6 +230,13 @@ its archive intact and waits before connecting. It never saves a replacement
 plaintext archive. Back up both the archive and its OS keyring key: copying only
 `archive.db` to another computer is insufficient.
 
+A missing key is different from a locked keyring. If ZapFast says the key is
+missing, restore the original OS credential store or use the original profile
+location. Do not delete the archive or create replacement credentials: neither
+can decrypt the existing archive. For help, report the OS, app version, whether
+the profile was moved/restored, and the error text with personal paths removed.
+Never attach the archive, keys, or full logs from older releases.
+
 Only `archive.db` and its SQLite journal/WAL are encrypted. Device credentials in
 `session.db`, downloaded media, profile pictures, saved sticker files and settings
 remain ordinary files. Use full-disk encryption for those files, swap, backups and
@@ -274,6 +289,28 @@ word). Open Settings from the gear or
 with `Ctrl+,`. Use the pencil to message a new number or save a contact. You
 can also open a group member's contact card. Saved names sync through WhatsApp
 to your phone and linked devices.
+
+### Locked chats
+
+Chats locked on your phone stay hidden from ZapFast's chat list, search,
+unread counts, forwarding destinations, and desktop notifications. Unlock a
+chat on your phone to show it here. Locking an open conversation closes it.
+ZapFast does not store a separate secret code or offer a desktop reveal flow.
+
+On the first start after upgrading, chats wait for WhatsApp's lock-state
+recovery before appearing. Failed recovery retries while keeping chats hidden.
+The recovered state is saved in the encrypted archive for offline use.
+
+Protocol logs omit private payloads and raw error details, including verbose
+logging. Panic logs record the source location without the panic payload.
+Pairing signature failures and rate limits retain a diagnostic category.
+
+Offline previews for these states use `--demo --demo-page channel`,
+`--demo --demo-page locked`, and `--demo --demo-page keyring`.
+
+The protocol dependency includes the upstream WhatsApp Business pairing fix.
+Device-store migration waits until an updated window is acknowledged, preserving
+startup rollback; an unused legacy column is retained for 0.14 compatibility.
 
 ## Files
 

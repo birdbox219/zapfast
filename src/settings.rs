@@ -148,8 +148,8 @@ impl Settings {
         match std::fs::read_to_string(path) {
             Ok(contents) => match serde_json::from_str(&contents) {
                 Ok(settings) => settings,
-                Err(error) => {
-                    log::warn!("settings file is unreadable, using defaults: {error}");
+                Err(_error) => {
+                    log::warn!("settings file is unreadable, using defaults");
                     Self::default()
                 }
             },

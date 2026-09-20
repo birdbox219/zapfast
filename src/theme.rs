@@ -521,6 +521,9 @@ pub fn icon_button(
 ) -> Response {
     let edge = size + 12.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(edge), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+    });
     if ui.is_rect_visible(rect) {
         let tint = if response.hovered() || response.has_focus() {
             hover
@@ -553,6 +556,9 @@ pub fn circle_button(
     tooltip: &str,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+    });
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         let grow = if hovered { 1.05 } else { 1.0 };
@@ -597,6 +603,9 @@ pub fn pill_button(ui: &mut egui::Ui, palette: &Palette, label: &str, primary: b
     let padding = Vec2::new(18.0, 8.0);
     let size = galley.size() + padding * 2.0;
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
     if ui.is_rect_visible(rect) {
         let hovered = response.hovered();
         let radius = rect.height() / 2.0;

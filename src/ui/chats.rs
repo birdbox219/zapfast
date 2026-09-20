@@ -581,6 +581,13 @@ fn archive_row(app: &mut App, ui: &mut egui::Ui, count: usize) {
         vec2(ui.available_width(), theme::ROW_HEIGHT),
         Sense::click(),
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("Archived, {count} chats"),
+        )
+    });
     if ui.is_rect_visible(rect) {
         if response.hovered() {
             ui.painter().rect_filled(rect, 0.0, palette.surface_hover);
@@ -628,6 +635,14 @@ fn row(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> egui::Response {
         vec2(ui.available_width(), theme::ROW_HEIGHT),
         Sense::click(),
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            format!("{title}, {} unread messages", chat.unread),
+        )
+    });
     if ui.is_rect_visible(rect) {
         if selected {
             ui.painter().rect_filled(rect, 0.0, palette.surface_active);

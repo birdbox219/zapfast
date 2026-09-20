@@ -706,7 +706,13 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 .inner_margin(Margin::symmetric(12, 8)),
         )
         .show(ui, |ui| {
-            if chat.read_only {
+            if !chat.can_send() {
+                if chat.kind == crate::model::ChatKind::Broadcast {
+                    ui.vertical_centered(|ui| {
+                        theme::text(ui, "Channels are read-only in ZapFast", theme::regular(13.5), palette.secondary);
+                    });
+                    return;
+                }
                 ui.vertical_centered(|ui| {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -916,6 +922,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                     crate::emoji::paint_cluster(ui, cluster, rect);
                                 }
                                 let response = &output.response.response;
+                                ui.ctx().accesskit_node_builder(response.id, |node| node.set_label("Message"));
                                 if response.changed() {
                                     app.actions.push(Action::Composing {
                                         chat: chat.id.clone(),
@@ -2356,7 +2363,7 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
                 if let Some(folder) = path.parent()
                     && widgets::menu_item(ui, &palette, Some(Icon::FileText), "Show in folder")
                 {
-                    actions.push(Action::OpenFile(folder.to_path_buf()));
+                    actions.push(Action::OpenFolder(folder.to_path_buf()));
                 }
             }
             None => {

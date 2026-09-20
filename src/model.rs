@@ -84,6 +84,8 @@ pub struct Chat {
     pub participants: Vec<String>,
     /// Whether this is an announcement group where we cannot post.
     pub read_only: bool,
+    /// Hidden while WhatsApp chat lock is enabled on the phone.
+    pub locked: bool,
     /// Disappearing-message duration in seconds, if enabled.
     pub ephemeral_expiration: Option<u32>,
 }
@@ -114,8 +116,14 @@ impl Chat {
             last: None,
             participants: Vec::new(),
             read_only: false,
+            locked: false,
             ephemeral_expiration: None,
         }
+    }
+
+    /// Newsletter publishing permissions are not supported by this client.
+    pub fn can_send(&self) -> bool {
+        !self.locked && !self.read_only && self.kind != ChatKind::Broadcast
     }
 
     pub fn is_group(&self) -> bool {
@@ -620,6 +628,7 @@ pub enum Action {
     CancelRecording,
     SendRecording,
     OpenFile(PathBuf),
+    OpenFolder(PathBuf),
     OpenMediaDir,
     OpenUrl(String),
     CopyText(String),
