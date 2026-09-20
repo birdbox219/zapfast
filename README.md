@@ -150,6 +150,12 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   folder copies existing downloaded attachments to the chosen location and updates
   their archived paths. Originals are kept, and existing files in the destination
   are never overwritten. A failed copy leaves the setting and archive paths unchanged.
+  If custom storage is disconnected, saved paths are retained. Changing or resetting
+  the folder fails without updating saved paths if a recorded custom file is
+  unavailable; reconnect the storage or restore missing custom files before retrying.
+  This also protects files
+  when an unmounted drive leaves an empty, readable mount point. Missing files in
+  the default cache can still be cleared for redownload.
   **Reset** uses the default cache again. Custom folders must be outside the app's
   cache. Unlinking removes this device and clears cache files while preserving
   custom folders and the attachments copied there.

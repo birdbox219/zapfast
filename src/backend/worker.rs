@@ -511,9 +511,13 @@ impl Worker {
         self.emit_chats();
     }
 
-    /// Repairs moved attachment paths or clears missing files for redownload.
+    /// Repairs disposable cache paths without forgetting unavailable external files.
     fn relocate_media(&mut self) {
         let dir = self.dirs.media_dir();
+        if self.dirs.custom_media.is_some() && std::fs::read_dir(&dir).is_err() {
+            log::warn!("attachment folder unavailable; keeping archived paths");
+            return;
+        }
         let rows = match self.archive.media_paths() {
             Ok(rows) => rows,
             Err(error) => {
@@ -523,17 +527,23 @@ impl Worker {
         };
         let (mut moved, mut forgotten) = (0, 0);
         for (chat, id, path) in rows {
-            if path.exists() {
+            // Existence errors and missing external files do not prove deletion.
+            // An unmounted drive may even leave a readable, empty mount point.
+            if !matches!(path.try_exists(), Ok(false))
+                || !media_storage::is_disposable_source(&self.dirs, &path)
+            {
                 continue;
             }
             let candidate = path.file_name().map(|name| dir.join(name));
-            match candidate.filter(|candidate| candidate.exists()) {
-                Some(candidate) => {
+            match candidate.as_ref().map(|candidate| candidate.try_exists()) {
+                Some(Ok(true)) => {
+                    let candidate = candidate.unwrap();
                     if self.archive.set_media_path(&chat, &id, &candidate).is_ok() {
                         moved += 1;
                     }
                 }
-                None => {
+                Some(Err(_)) => continue,
+                Some(Ok(false)) | None => {
                     if self.archive.clear_media_path(&chat, &id).is_ok() {
                         forgotten += 1;
                     }

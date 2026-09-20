@@ -5,6 +5,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::{Event, Worker};
+use crate::paths::AppDirs;
+
+/// Only known cache files may be forgotten automatically. An absent external
+/// file may belong to an unmounted drive, even if its mount point is readable.
+pub(super) fn is_disposable_source(dirs: &AppDirs, path: &Path) -> bool {
+    AppDirs::is_subpath(path, &dirs.media_cache_dir())
+        && !dirs
+            .custom_media
+            .as_ref()
+            .is_some_and(|custom| AppDirs::is_subpath(path, custom))
+}
 
 /// Removes newly published copies on failure, but never touches the source files.
 #[derive(Default)]
@@ -25,6 +36,11 @@ impl Copies {
 
     fn copy(&mut self, source: &Path, dir: &Path) -> std::io::Result<PathBuf> {
         let name = source.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+        // Validate even when the source is already in the destination folder.
+        let mut input = std::fs::File::open(source)?;
+        if !input.metadata()?.is_file() {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
         if source
             .parent()
             .and_then(|parent| parent.canonicalize().ok())
@@ -32,7 +48,6 @@ impl Copies {
         {
             return Ok(source.to_owned());
         }
-        let mut input = std::fs::File::open(source)?;
         let mut staged = tempfile::NamedTempFile::new_in(dir)?;
         std::io::copy(&mut input, &mut staged)?;
         staged.as_file().sync_all()?;
@@ -88,22 +103,36 @@ impl Worker {
     }
 
     async fn try_change_media_dir(&mut self, custom: Option<PathBuf>) -> Result<(), String> {
-        let custom = custom.filter(|path| !self.dirs.is_default_media_dir(path));
-        let dir = custom
-            .clone()
-            .unwrap_or_else(|| self.dirs.media_cache_dir());
-        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-        // Resolve symlinks and '..' before checking the cache boundary.
-        let dir = dir.canonicalize().map_err(|error| error.to_string())?;
-        if custom.is_some() && self.dirs.is_cache_path(&dir) {
-            return Err("Custom attachment folder cannot be inside the cache directory".into());
-        }
-        let custom = custom.map(|_| dir.clone());
         let rows = self
             .archive
             .media_paths()
             .map_err(|error| error.to_string())?;
-        let (copies, updates, paths) = tokio::task::spawn_blocking(move || {
+        let dirs = self.dirs.clone();
+        let (custom, copies, updates, paths) = tokio::task::spawn_blocking(move || {
+            // Inspect the old folder before creating any destination. Selecting
+            // the same unavailable folder must not recreate it and hide an outage.
+            if !rows.is_empty()
+                && let Some(source_dir) = &dirs.custom_media
+            {
+                std::fs::read_dir(source_dir).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        "Current attachment folder is unavailable. Reconnect it and retry",
+                    )
+                })?;
+            }
+            let custom = custom.filter(|path| !dirs.is_default_media_dir(path));
+            let dir = custom.clone().unwrap_or_else(|| dirs.media_cache_dir());
+            std::fs::create_dir_all(&dir)?;
+            // Resolve symlinks and '..' before checking the cache boundary.
+            let dir = dir.canonicalize()?;
+            if custom.is_some() && dirs.is_cache_path(&dir) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Custom attachment folder cannot be inside the cache directory",
+                ));
+            }
+            let custom = custom.map(|_| dir.clone());
             // Even an empty archive must not accept an unwritable directory.
             let _probe = tempfile::NamedTempFile::new_in(&dir)?;
             let mut copies = Copies::default();
@@ -115,14 +144,20 @@ impl Worker {
                 } else {
                     let path = match source.try_exists()? {
                         true => Some(copies.copy(&source, &dir)?),
-                        false => None,
+                        false if is_disposable_source(&dirs, &source) => None,
+                        false => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "A saved attachment is unavailable. Restore its file or reconnect its storage and retry",
+                            ));
+                        }
                     };
                     paths.insert(source, path.clone());
                     path
                 };
                 updates.push((chat, id, replacement));
             }
-            Ok::<_, std::io::Error>((copies, updates, paths))
+            Ok::<_, std::io::Error>((custom, copies, updates, paths))
         })
         .await
         .map_err(|_| "Attachment copy task failed".to_owned())?
@@ -381,5 +416,227 @@ mod tests {
         worker.dirs.custom_media = Some(cache);
         worker.clean_media_cache();
         assert!(saved.exists());
+    }
+
+    #[test]
+    fn startup_retains_custom_paths_until_storage_returns() {
+        // A disconnected mount may disappear, leave an empty directory, or fail
+        // directory inspection. Replacing it with a file simulates that last case
+        // without depending on platform ACLs or whether tests run as root.
+        for unavailable in ["missing", "empty", "not-directory"] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut worker, _events, _commands, _wa) = super::super::receipt_tests::worker();
+            worker.dirs = AppDirs::under(root.path());
+            let custom = root.path().join("mounted");
+            std::fs::create_dir_all(&custom).unwrap();
+            let source = custom.join("photo.jpg");
+            std::fs::write(&source, b"preserved").unwrap();
+            worker.dirs.custom_media = Some(custom.clone());
+            attachment(&worker, "image", &source);
+            let offline = root.path().join("offline");
+            std::fs::rename(&custom, &offline).unwrap();
+            match unavailable {
+                "empty" => std::fs::create_dir(&custom).unwrap(),
+                "not-directory" => std::fs::write(&custom, b"blocked").unwrap(),
+                _ => {}
+            }
+
+            worker.relocate_media();
+            assert_eq!(archived_path(&worker, "image"), Some(source.clone()));
+            match unavailable {
+                "empty" => std::fs::remove_dir(&custom).unwrap(),
+                "not-directory" => std::fs::remove_file(&custom).unwrap(),
+                _ => {}
+            }
+            std::fs::rename(offline, custom).unwrap();
+            worker.relocate_media();
+            assert_eq!(archived_path(&worker, "image"), Some(source.clone()));
+            assert_eq!(std::fs::read(source).unwrap(), b"preserved");
+        }
+    }
+
+    #[test]
+    fn startup_does_not_replace_an_external_path_with_a_same_named_cache_file() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut worker, _events, _commands, _wa) = super::super::receipt_tests::worker();
+        worker.dirs = AppDirs::under(root.path());
+        // Legacy archives can retain paths outside the currently configured folder.
+        let source = root.path().join("offline/photo.jpg");
+        attachment(&worker, "image", &source);
+        let decoy = worker.dirs.ensure_media_dir().unwrap().join("photo.jpg");
+        std::fs::write(&decoy, b"unrelated").unwrap();
+
+        worker.relocate_media();
+        assert_eq!(archived_path(&worker, "image"), Some(source));
+        assert_eq!(std::fs::read(decoy).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn startup_still_repairs_and_clears_disposable_cache_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut worker, _events, _commands, _wa) = super::super::receipt_tests::worker();
+        worker.dirs = AppDirs::under(root.path());
+        let cache = worker.dirs.ensure_media_dir().unwrap();
+        let existing = cache.join("existing.jpg");
+        let moved = cache.join("moved.jpg");
+        std::fs::write(&existing, b"existing").unwrap();
+        std::fs::write(&moved, b"moved").unwrap();
+        attachment(&worker, "existing", &existing);
+        attachment(&worker, "moved", &cache.join("old/moved.jpg"));
+        attachment(&worker, "missing", &cache.join("missing.jpg"));
+
+        worker.relocate_media();
+        assert_eq!(archived_path(&worker, "existing"), Some(existing));
+        assert_eq!(archived_path(&worker, "moved"), Some(moved));
+        assert_eq!(archived_path(&worker, "missing"), None);
+    }
+
+    #[tokio::test]
+    async fn unavailable_custom_storage_blocks_changes_and_reset_until_it_returns() {
+        for unavailable in ["missing", "empty", "not-directory"] {
+            for destination in ["new", "default", "same"] {
+                let root = tempfile::tempdir().unwrap();
+                let (mut worker, events, _commands, _wa) = super::super::receipt_tests::worker();
+                worker.dirs = AppDirs::under(root.path());
+                let custom = root.path().join("mounted");
+                std::fs::create_dir_all(&custom).unwrap();
+                let source = custom.join("photo.jpg");
+                std::fs::write(&source, b"preserved").unwrap();
+                worker.dirs.custom_media = Some(custom.clone());
+                attachment(&worker, "image", &source);
+                let target = match destination {
+                    "new" => Some(root.path().join("new")),
+                    "same" => Some(custom.clone()),
+                    _ => None,
+                };
+                let offline = root.path().join("offline");
+                std::fs::rename(&custom, &offline).unwrap();
+                match unavailable {
+                    "empty" => std::fs::create_dir(&custom).unwrap(),
+                    "not-directory" => std::fs::write(&custom, b"blocked").unwrap(),
+                    _ => {}
+                }
+
+                worker.change_media_dir(target.clone()).await;
+                assert!(matches!(events.try_recv().unwrap(), Event::Error(_)));
+                assert!(events.try_recv().is_err());
+                assert_eq!(worker.dirs.custom_media, Some(custom.clone()));
+                assert_eq!(archived_path(&worker, "image"), Some(source.clone()));
+                match unavailable {
+                    "empty" => std::fs::remove_dir(&custom).unwrap(),
+                    "not-directory" => std::fs::remove_file(&custom).unwrap(),
+                    _ => assert!(!custom.exists(), "must not recreate the source folder"),
+                }
+
+                std::fs::rename(offline, custom).unwrap();
+                worker.change_media_dir(target).await;
+                assert!(matches!(
+                    events.try_recv().unwrap(),
+                    Event::MediaDirChanged { .. }
+                ));
+                let saved = archived_path(&worker, "image").unwrap();
+                assert_eq!(std::fs::read(saved).unwrap(), b"preserved");
+                assert_eq!(std::fs::read(source).unwrap(), b"preserved");
+                if destination == "default" {
+                    assert_eq!(worker.dirs.custom_media, None);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_external_file_rolls_back_copies_even_with_readable_folders() {
+        for custom_configured in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut worker, events, _commands, _wa) = super::super::receipt_tests::worker();
+            worker.dirs = AppDirs::under(root.path());
+            let source_dir = root.path().join("external");
+            std::fs::create_dir_all(&source_dir).unwrap();
+            let present = source_dir.join("present.jpg");
+            let missing = source_dir.join("missing.jpg");
+            std::fs::write(&present, b"preserved").unwrap();
+            if custom_configured {
+                worker.dirs.custom_media = Some(source_dir.clone());
+            }
+            let previous = worker.dirs.custom_media.clone();
+            attachment(&worker, "first", &present);
+            attachment(&worker, "second", &missing);
+            let target = root.path().join("target");
+            std::fs::create_dir_all(&target).unwrap();
+            let unrelated = target.join("present.jpg");
+            std::fs::write(&unrelated, b"unrelated").unwrap();
+
+            worker.change_media_dir(Some(target.clone())).await;
+            assert!(matches!(events.try_recv().unwrap(), Event::Error(_)));
+            assert!(events.try_recv().is_err());
+            assert_eq!(worker.dirs.custom_media, previous);
+            assert_eq!(archived_path(&worker, "first"), Some(present.clone()));
+            assert_eq!(archived_path(&worker, "second"), Some(missing.clone()));
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+            assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated");
+            assert_eq!(std::fs::read(present).unwrap(), b"preserved");
+
+            std::fs::write(missing, b"restored").unwrap();
+            worker.change_media_dir(Some(target)).await;
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                Event::MediaDirChanged { .. }
+            ));
+            assert_eq!(
+                std::fs::read(archived_path(&worker, "second").unwrap()).unwrap(),
+                b"restored"
+            );
+            assert_eq!(std::fs::read(unrelated).unwrap(), b"unrelated");
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_custom_folder_without_archived_files_can_be_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut worker, events, _commands, _wa) = super::super::receipt_tests::worker();
+        worker.dirs = AppDirs::under(root.path());
+        let unavailable = root.path().join("offline");
+        worker.dirs.custom_media = Some(unavailable.clone());
+
+        worker.change_media_dir(None).await;
+        assert_eq!(worker.dirs.custom_media, None);
+        assert!(!unavailable.exists());
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            Event::MediaDirChanged { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ancestor_custom_folder_preserves_copies_but_not_disposable_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut worker, _events, _commands, _wa) = super::super::receipt_tests::worker();
+        worker.dirs = AppDirs::under(root.path());
+        let cache = worker.dirs.ensure_media_dir().unwrap();
+        let source = cache.join("photo.jpg");
+        std::fs::write(&source, b"preserved").unwrap();
+        attachment(&worker, "image", &source);
+        let unrelated = root.path().join("user.txt");
+        std::fs::write(&unrelated, b"unrelated").unwrap();
+
+        worker.change_media_dir(Some(root.path().to_owned())).await;
+        let saved = archived_path(&worker, "image").unwrap();
+        assert_eq!(saved.parent().unwrap(), root.path().canonicalize().unwrap());
+        worker.clean_media_cache();
+        assert!(!cache.exists());
+        assert_eq!(std::fs::read(saved).unwrap(), b"preserved");
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn same_folder_copy_still_checks_that_the_source_is_a_readable_file() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing.jpg");
+        let directory = root.path().join("directory.jpg");
+        std::fs::create_dir(&directory).unwrap();
+        let mut copies = Copies::default();
+        assert!(copies.copy(&missing, root.path()).is_err());
+        assert!(copies.copy(&directory, root.path()).is_err());
+        assert!(directory.is_dir());
     }
 }
