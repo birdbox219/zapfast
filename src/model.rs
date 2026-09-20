@@ -620,6 +620,7 @@ pub enum Action {
     CancelRecording,
     SendRecording,
     OpenFile(PathBuf),
+    OpenMediaDir,
     OpenUrl(String),
     CopyText(String),
     /// Starts a reply to a message in the open chat.

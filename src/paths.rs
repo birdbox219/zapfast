@@ -119,6 +119,13 @@ impl AppDirs {
             .unwrap_or_else(|| self.media_cache_dir())
     }
 
+    /// Creates the effective attachment folder before opening it in the desktop.
+    pub fn ensure_media_dir(&self) -> std::io::Result<PathBuf> {
+        let dir = self.media_dir();
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
     /// Returns true if `path` resolves to the default media cache directory.
     pub fn is_default_media_dir(&self, path: &Path) -> bool {
         let default = self.media_cache_dir();
@@ -382,6 +389,25 @@ mod tests {
         assert!(!dirs.is_cache_path(&root.join("external-downloads")));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_media_folder_creates_it_before_and_after_cache_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let mut dirs = AppDirs::under(root.path());
+        dirs.ensure().unwrap();
+        assert!(!dirs.media_dir().exists());
+        assert!(dirs.ensure_media_dir().unwrap().is_dir());
+        std::fs::remove_dir_all(dirs.media_cache_dir()).unwrap();
+        assert!(dirs.ensure_media_dir().unwrap().is_dir());
+
+        dirs.custom_media = Some(root.path().join("custom"));
+        assert!(dirs.ensure_media_dir().unwrap().is_dir());
+        let blocked = root.path().join("file");
+        std::fs::write(&blocked, b"fixture").unwrap();
+        dirs.custom_media = Some(blocked.clone());
+        assert!(dirs.ensure_media_dir().is_err());
+        assert_eq!(std::fs::read(blocked).unwrap(), b"fixture");
     }
 
     #[test]

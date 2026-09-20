@@ -1238,28 +1238,24 @@ impl App {
                         self.update_download = crate::updates::DownloadState::Failed(error)
                     }
                 },
-                Event::MediaDirChanged(custom) => {
+                Event::MediaDirChanged { custom, paths } => {
                     self.dirs.custom_media = custom.clone();
                     self.settings.custom_media_dir = custom;
                     self.mark_settings_dirty();
-                    let dir = self.dirs.media_dir();
-                    for conversation in self.conversations.values_mut() {
-                        for message in &mut conversation.messages {
-                            let Some(media) = message.content.media_mut() else {
-                                continue;
-                            };
-                            let Some(path) = &media.path else {
-                                continue;
-                            };
-                            let Some(name) = path.file_name() else {
-                                continue;
-                            };
-                            if !path.exists() {
-                                let candidate = dir.join(name);
-                                if candidate.exists() {
-                                    media.path = Some(candidate);
-                                }
-                            }
+                    for message in self
+                        .conversations
+                        .values_mut()
+                        .flat_map(|conversation| &mut conversation.messages)
+                        .chain(&mut self.search_hits)
+                    {
+                        let Some(media) = message.content.media_mut() else {
+                            continue;
+                        };
+                        let Some(path) = &media.path else {
+                            continue;
+                        };
+                        if let Some(replacement) = paths.get(path) {
+                            media.path = replacement.clone();
                         }
                     }
                     self.toast(if self.dirs.custom_media.is_some() {
@@ -1986,6 +1982,12 @@ impl App {
                     self.toast_error(format!("Could not open {}: {error}", path.display()));
                 }
             }
+            Action::OpenMediaDir => match self.dirs.ensure_media_dir() {
+                Ok(path) => self.apply(Action::OpenFile(path), ctx),
+                Err(error) => {
+                    self.toast_error(format!("Could not create attachment folder: {error}"))
+                }
+            },
             Action::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
             Action::CopyText(text) => {
                 ctx.copy_text(text);
@@ -3698,7 +3700,9 @@ mod name_tests {
         assert_eq!(app.settings.custom_media_dir, None);
 
         let chat = "15550001111@s.whatsapp.net";
-        let old_missing = directory.path().join("old_cache/photo.jpg");
+        let old_path = directory.path().join("old_cache/photo.jpg");
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        std::fs::write(&old_path, b"image payload").unwrap();
         let message = Message {
             id: "m_img".into(),
             chat: chat.into(),
@@ -3713,7 +3717,7 @@ mod name_tests {
                     size: 100,
                     width: None,
                     height: None,
-                    path: Some(old_missing),
+                    path: Some(old_path.clone()),
                     state: MediaState::Idle,
                 },
             },
@@ -3727,6 +3731,7 @@ mod name_tests {
             forwarded: false,
             thumbnail: None,
         };
+        app.search_hits.push(message.clone());
         let conversation = Conversation {
             messages: vec![message],
             ..Default::default()
@@ -3735,11 +3740,14 @@ mod name_tests {
 
         let custom = directory.path().join("custom_downloads");
         std::fs::create_dir_all(&custom).unwrap();
-        let replacement = custom.join("photo.jpg");
+        let replacement = custom.join("collision-photo.jpg");
         std::fs::write(&replacement, b"image payload").unwrap();
 
         events
-            .send(Event::MediaDirChanged(Some(custom.clone())))
+            .send(Event::MediaDirChanged {
+                custom: Some(custom.clone()),
+                paths: [(old_path, Some(replacement.clone()))].into(),
+            })
             .unwrap();
         app.background_frame(&ctx);
         assert_eq!(app.dirs.custom_media, Some(custom.clone()));
@@ -3755,7 +3763,16 @@ mod name_tests {
             Some(&replacement)
         );
 
-        events.send(Event::MediaDirChanged(None)).unwrap();
+        assert_eq!(
+            app.search_hits[0].content.media().unwrap().path,
+            Some(replacement)
+        );
+        events
+            .send(Event::MediaDirChanged {
+                custom: None,
+                paths: Default::default(),
+            })
+            .unwrap();
         app.background_frame(&ctx);
         assert_eq!(app.dirs.custom_media, None);
         assert_eq!(app.settings.custom_media_dir, None);

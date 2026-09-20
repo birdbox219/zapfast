@@ -34,6 +34,7 @@ use whatsapp_rust::wacore_binary::jid::JidExt;
 use whatsapp_rust::waproto::buffa::Message as _;
 use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
 
+mod media_storage;
 mod poll_history;
 mod polls;
 
@@ -510,8 +511,7 @@ impl Worker {
         self.emit_chats();
     }
 
-    /// Re-derives archived rows from raw protobufs after parser changes. Also
-    /// repairs moved attachment paths or clears missing files for redownload.
+    /// Repairs moved attachment paths or clears missing files for redownload.
     fn relocate_media(&mut self) {
         let dir = self.dirs.media_dir();
         let rows = match self.archive.media_paths() {
@@ -1366,6 +1366,11 @@ impl Worker {
     /// Cleans the media cache directory on logout without removing any configured custom media subtree.
     fn clean_media_cache(&self) {
         let media_cache = self.dirs.media_cache_dir();
+        if let Some(custom) = &self.dirs.custom_media
+            && AppDirs::is_subpath(&media_cache, custom)
+        {
+            return;
+        }
         if let Some(custom) = &self.dirs.custom_media
             && AppDirs::is_subpath(custom, &media_cache)
         {
@@ -2609,27 +2614,10 @@ impl Worker {
                 });
             }
             Command::SetMediaDir(dir) => {
-                if self.dirs.is_default_media_dir(&dir) {
-                    self.dirs.custom_media = None;
-                    self.relocate_media();
-                    self.emit(Event::MediaDirChanged(None));
-                    return;
-                }
-                if self.dirs.is_cache_path(&dir) {
-                    self.emit(Event::Error(
-                        "Custom attachment folder cannot be inside the cache directory".to_owned(),
-                    ));
-                    return;
-                }
-                let _ = std::fs::create_dir_all(&dir);
-                self.dirs.custom_media = Some(dir.clone());
-                self.relocate_media();
-                self.emit(Event::MediaDirChanged(Some(dir)));
+                self.change_media_dir(Some(dir)).await;
             }
             Command::ResetMediaDir => {
-                self.dirs.custom_media = None;
-                self.relocate_media();
-                self.emit(Event::MediaDirChanged(None));
+                self.change_media_dir(None).await;
             }
             Command::SaveContact {
                 id,
@@ -2992,6 +2980,8 @@ impl Worker {
                 }
             }
             Command::Downloaded { chat, id, result } => {
+                // A download can finish after its original folder was changed.
+                let result = result.and_then(|path| self.keep_current_media(&path));
                 if let Ok(path) = &result {
                     let _ = self.archive.set_media_path(&chat, &id, path);
                 }
@@ -3486,17 +3476,8 @@ impl Worker {
         let commands = self.commands.clone();
         tokio::spawn(async move {
             let keep = |bytes: Vec<u8>| {
-                let dir = dir.clone();
                 let path = media_path(&dir, &chat, &id, &mime, file_name.as_deref());
-                async move {
-                    tokio::fs::create_dir_all(&dir)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    tokio::fs::write(&path, &bytes)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(path)
-                }
+                media_storage::save(path, bytes)
             };
             let result = match client.download(&*downloadable).await {
                 Ok(bytes) => keep(bytes).await,
@@ -4255,7 +4236,7 @@ impl Worker {
     }
 
     /// Archives and sends an uploaded attachment message.
-    fn outbound(&mut self, chat: ChatId, row: Message, raw: Vec<u8>) {
+    fn outbound(&mut self, chat: ChatId, mut row: Message, raw: Vec<u8>) {
         let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&chat)) else {
             self.emit(Event::Error("Not connected to WhatsApp".to_owned()));
             return;
@@ -4264,6 +4245,17 @@ impl Worker {
             self.emit(Event::Error("Could not encode the attachment".to_owned()));
             return;
         };
+        if let Some(media) = row.content.media_mut()
+            && let Some(path) = &media.path
+        {
+            match self.keep_current_media(path) {
+                Ok(path) => media.path = Some(path),
+                Err(error) => {
+                    self.emit(Event::Error(error));
+                    return;
+                }
+            }
+        }
         let expiration = self.apply_ephemeral(&chat, &mut message);
         let raw = message.encode_to_vec();
         let id = row.id.clone();
@@ -5246,12 +5238,7 @@ async fn file_outbound(
         &prepared.mime,
         prepared.file_name.as_deref(),
     );
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|error| error.to_string())?;
-    tokio::fs::write(&path, &prepared.bytes)
-        .await
-        .map_err(|error| error.to_string())?;
+    let path = media_storage::save(path, prepared.bytes).await?;
     let mut content = prepared.content;
     if let Some(media) = content.media_mut() {
         media.path = Some(path);

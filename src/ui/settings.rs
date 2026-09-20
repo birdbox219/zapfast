@@ -198,7 +198,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         &media.display().to_string(),
                         |ui| {
                             if theme::soft_button(ui, &palette, Some(Icon::ExternalLink), "Open folder", false).clicked() {
-                                app.actions.push(Action::OpenFile(media.clone()));
+                                app.actions.push(Action::OpenMediaDir);
                             }
                             if theme::soft_button(ui, &palette, Some(Icon::Pencil), "Change", false).clicked() {
                                 app.actions.push(Action::PickMediaDir);

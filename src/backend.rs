@@ -536,7 +536,10 @@ pub enum Event {
     UpdateDownloaded(Result<Box<crate::updates::install::Prepared>, String>),
     UpdateInstalling(Result<(), String>),
     /// Attachment download directory changed (`None` indicates default).
-    MediaDirChanged(Option<PathBuf>),
+    MediaDirChanged {
+        custom: Option<PathBuf>,
+        paths: std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    },
     Error(String),
 }
 

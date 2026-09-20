@@ -146,8 +146,13 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   SQLCipher-encrypted archive, unlocked automatically through your OS keyring.
   Existing plaintext archives are migrated on first use. Attachments remain
   ordinary files in the cache directory, or in a custom folder configured in
-  Settings. Unlinking removes this device and clears cache files while
-  preserving custom folders.
+  Settings under **Downloaded attachments → Change**. Changing or resetting the
+  folder copies existing downloaded attachments to the chosen location and updates
+  their archived paths. Originals are kept, and existing files in the destination
+  are never overwritten. A failed copy leaves the setting and archive paths unchanged.
+  **Reset** uses the default cache again. Custom folders must be outside the app's
+  cache. Unlinking removes this device and clears cache files while preserving
+  custom folders and the attachments copied there.
 
 ## What it does not do yet
 
