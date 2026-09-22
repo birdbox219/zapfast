@@ -37,8 +37,9 @@ pack to remove it. Packs are stored as WebP files on your computer.
 Paste a picture, drop files on the window, or select them with the paperclip.
 They stay above the composer until you send them, with the typed text as a
 caption. Press Escape or click a file's close button to remove it. Incoming
-attachments up to 64 MB download when they enter view, or on click if automatic
-downloads are off. If an attachment has expired, ZapFast asks your phone to
+non-sticker attachments up to 64 MiB download when they enter view if automatic
+downloads are on, or on click. Visible stickers download automatically up to the
+same limit. If an attachment has expired, ZapFast asks your phone to
 upload it again.
 
 ## Voice messages
@@ -83,8 +84,8 @@ see its picture, number, and group members.
 
 Closing the window keeps ZapFast linked in the tray. Click the tray icon or
 launch the app again to reopen it. Notifications show the chat picture and open
-the chat when clicked. Muted chats do not send notifications. You can change
-both settings.
+the chat when clicked. Muted chats do not send notifications, and archived
+chats stay quiet until you unarchive them. You can change both settings.
 
 Press `Ctrl+/` or click the keyboard button under the composer to list all
 shortcuts.

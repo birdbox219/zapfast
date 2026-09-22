@@ -251,6 +251,8 @@ pub enum Command {
     },
     /// Syncs chat mute state. `Some(0)` is indefinite and `None` unmutes.
     SetMuted(ChatId, Option<i64>),
+    /// Locks or unlocks a chat (the locked folder).
+    SetLocked(ChatId, bool),
     /// Normalizes, encodes, and sends mono 48 kHz push-to-talk audio.
     SendVoice {
         chat: ChatId,
@@ -344,6 +346,14 @@ pub enum Command {
         emoji: String,
     },
     SetArchived(ChatId, bool),
+    /// Deletes a chat on the phone, then here once the phone agreed.
+    DeleteChat(ChatId),
+    /// Whether the phone deleted a chat requested through `DeleteChat`.
+    ChatDeleted {
+        chat: ChatId,
+        deleted: bool,
+        through: i64,
+    },
     SetPinned(ChatId, bool),
     PairWithPhone(String),
     /// Unlinks the device remotely and locally.
@@ -500,6 +510,15 @@ pub enum Event {
     MessageDeleted {
         chat: ChatId,
         id: String,
+    },
+    /// A chat was deleted here or on a linked device.
+    ChatRemoved {
+        chat: ChatId,
+    },
+    /// A chat's messages were cleared while the chat itself stays.
+    ChatCleared {
+        chat: ChatId,
+        through: i64,
     },
     /// GIF search results or failure.
     Gifs {
