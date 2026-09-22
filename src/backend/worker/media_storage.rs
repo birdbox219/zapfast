@@ -111,8 +111,10 @@ impl Worker {
         let (custom, copies, updates, paths) = tokio::task::spawn_blocking(move || {
             // Inspect the old folder before creating any destination. Selecting
             // the same unavailable folder must not recreate it and hide an outage.
-            if !rows.is_empty()
-                && let Some(source_dir) = &dirs.custom_media
+            if let Some(source_dir) = &dirs.custom_media
+                && rows
+                    .iter()
+                    .any(|(_, _, source)| AppDirs::is_subpath(source, source_dir))
             {
                 std::fs::read_dir(source_dir).map_err(|error| {
                     std::io::Error::new(
@@ -613,16 +615,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_custom_folder_without_archived_files_can_be_reset() {
+    async fn unavailable_custom_folder_without_archived_custom_files_can_be_reset() {
         let root = tempfile::tempdir().unwrap();
         let (mut worker, events, _commands, _wa) = super::super::receipt_tests::worker();
         worker.dirs = AppDirs::under(root.path());
         let unavailable = root.path().join("offline");
         worker.dirs.custom_media = Some(unavailable.clone());
+        let cached = worker.dirs.media_cache_dir().join("cached.jpg");
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, b"fixture").unwrap();
+        attachment(&worker, "cached", &cached);
 
         worker.change_media_dir(None).await;
         assert_eq!(worker.dirs.custom_media, None);
         assert!(!unavailable.exists());
+        assert_eq!(archived_path(&worker, "cached"), Some(cached));
         assert!(matches!(
             events.try_recv().unwrap(),
             Event::MediaDirChanged { .. }

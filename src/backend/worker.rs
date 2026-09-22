@@ -147,16 +147,9 @@ async fn download_attachment(
         Ok(writer) => {
             // Close the verified file before publishing it, including on Windows.
             drop(writer);
-            match publish_attachment(&temporary, path).await {
-                Ok(()) => Ok(path.to_path_buf()),
-                Err(error) => {
-                    let _ = tokio::fs::remove_file(&temporary).await;
-                    Err(error.to_string())
-                }
-            }
+            publish_attachment(temporary, path).await
         }
         Err(error) => {
-            let _ = tokio::fs::remove_file(&temporary).await;
             let error = error.to_string();
             if error.contains(ATTACHMENT_LIMIT_ERROR) {
                 Err(ATTACHMENT_LIMIT_ERROR.to_owned())
@@ -168,22 +161,41 @@ async fn download_attachment(
 }
 
 /// Publishes a complete attachment only after its download has been verified.
-async fn publish_attachment(temporary: &Path, path: &Path) -> Result<(), String> {
-    // Windows does not replace an existing destination during rename. A stale
-    // cache file has no archive reference, and active downloads are deduplicated.
-    #[cfg(windows)]
-    if path.exists() {
-        tokio::fs::remove_file(path)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    tokio::fs::rename(temporary, path)
+///
+/// The preferred name can already belong to a user's unrelated file, especially
+/// in a custom folder. `persist_noclobber` keeps that file intact and returns
+/// the distinct name that must be recorded in the archive.
+async fn publish_attachment(temporary: tempfile::TempPath, path: &Path) -> Result<PathBuf, String> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || persist_attachment_noclobber(temporary, &path))
         .await
+        .map_err(|_| "Attachment publish task failed".to_owned())?
         .map_err(|error| error.to_string())
 }
 
-/// A hidden, per-attempt path in the destination directory, so a verified
-/// download can replace the cache file atomically.
+fn persist_attachment_noclobber(
+    mut temporary: tempfile::TempPath,
+    preferred: &Path,
+) -> io::Result<PathBuf> {
+    let name = preferred.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+    let mut target = preferred.to_owned();
+    loop {
+        match temporary.persist_noclobber(&target) {
+            Ok(()) => return Ok(target),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                temporary = error.path;
+                // A collision is never evidence that the existing file is ours.
+                let mut unique =
+                    std::ffi::OsString::from(format!("{:016x}-", rand::random::<u64>()));
+                unique.push(name);
+                target = preferred.with_file_name(unique);
+            }
+            Err(error) => return Err(error.error),
+        }
+    }
+}
+
+/// A hidden, per-attempt path in the destination directory.
 fn temporary_attachment_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
@@ -192,9 +204,8 @@ fn temporary_attachment_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{:016x}.part", rand::random::<u64>()))
 }
 
-/// Creates an exclusive temporary file, retrying a vanishingly unlikely name
-/// collision without ever opening another download's staging file.
-fn temporary_attachment_file(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
+/// Creates an exclusive, self-cleaning staging file next to the destination.
+fn temporary_attachment_file(path: &Path) -> Result<(tempfile::TempPath, std::fs::File), String> {
     for _ in 0..8 {
         let temporary = temporary_attachment_path(path);
         match std::fs::OpenOptions::new()
@@ -202,7 +213,14 @@ fn temporary_attachment_file(path: &Path) -> Result<(PathBuf, std::fs::File), St
             .create_new(true)
             .open(&temporary)
         {
-            Ok(file) => return Ok((temporary, file)),
+            Ok(file) => match tempfile::TempPath::try_from_path(&temporary) {
+                Ok(temporary) => return Ok((temporary, file)),
+                Err(error) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(error.to_string());
+                }
+            },
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.to_string()),
         }
@@ -223,14 +241,28 @@ fn discard_attachment_staging(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.')
-            && name.ends_with(".part")
+        if is_attachment_staging_name(&name)
             && entry.path().is_file()
             && let Err(_) = std::fs::remove_file(entry.path())
         {
             log::warn!("could not remove incomplete attachment");
         }
     }
+}
+
+/// Only remove paths with the exact randomized format produced above. A custom
+/// folder can contain the user's own hidden partial files, which are not ours.
+fn is_attachment_staging_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".part"))
+    else {
+        return false;
+    };
+    let Some((_, random)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    random.len() == 16 && random.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn account_allows_receipts(
@@ -403,6 +435,9 @@ pub async fn run(
     worker.backfill();
     worker.relocate_media();
     discard_attachment_staging(&worker.dirs.media_cache_dir());
+    if worker.dirs.custom_media.is_some() {
+        discard_attachment_staging(&worker.dirs.media_dir());
+    }
     discard_attachment_staging(&worker.dirs.sticker_cache_dir());
     worker.start_bot().await;
     let mut wa_events = wa_events;
@@ -6245,7 +6280,7 @@ mod tests {
         let destination = directory.join("photo.jpg");
         let (first_path, first) = temporary_attachment_file(&destination).expect("first file");
         let (second_path, second) = temporary_attachment_file(&destination).expect("second file");
-        assert_ne!(first_path, second_path);
+        assert_ne!(first_path.as_ref() as &Path, second_path.as_ref() as &Path);
         assert!(
             first_path
                 .file_name()
@@ -6253,6 +6288,9 @@ mod tests {
                 .to_string_lossy()
                 .starts_with('.')
         );
+        assert!(is_attachment_staging_name(
+            &first_path.file_name().unwrap().to_string_lossy()
+        ));
         assert!(!destination.exists());
         drop((first, second));
         std::fs::write(&destination, b"complete attachment").expect("writes completed file");
@@ -6264,6 +6302,33 @@ mod tests {
             b"complete attachment"
         );
         std::fs::remove_dir_all(&directory).expect("removes staging directory");
+    }
+
+    #[test]
+    fn staging_cleanup_leaves_unrelated_hidden_partial_files() {
+        let directory = tempfile::tempdir().expect("creates staging directory");
+        let unrelated = directory.path().join(".editor-recovery.part");
+        std::fs::write(&unrelated, b"user file").expect("writes unrelated file");
+        discard_attachment_staging(directory.path());
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"user file");
+    }
+
+    #[tokio::test]
+    async fn publishing_attachment_preserves_an_existing_file() {
+        let directory = tempfile::tempdir().expect("creates destination directory");
+        let destination = directory.path().join("photo.jpg");
+        std::fs::write(&destination, b"unrelated").expect("writes existing file");
+        let (temporary, mut file) = temporary_attachment_file(&destination).expect("stages file");
+        file.write_all(b"downloaded attachment")
+            .expect("writes staged attachment");
+        drop(file);
+
+        let published = publish_attachment(temporary, &destination)
+            .await
+            .expect("publishes without clobbering");
+        assert_ne!(published, destination);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"unrelated");
+        assert_eq!(std::fs::read(&published).unwrap(), b"downloaded attachment");
     }
 
     #[test]
