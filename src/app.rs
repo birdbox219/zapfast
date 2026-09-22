@@ -314,10 +314,16 @@ impl Default for AppOptions {
 }
 
 impl App {
-    pub fn new(waker: &Waker, mut dirs: AppDirs, settings: Settings, options: AppOptions) -> Self {
-        dirs.custom_media = settings.custom_media_dir.clone();
+    pub fn new(
+        waker: &Waker,
+        mut dirs: AppDirs,
+        mut settings: Settings,
+        options: AppOptions,
+    ) -> Self {
+        let settings_changed = Self::restore_media_dir(&mut dirs, &mut settings);
         let backend = Backend::spawn(dirs.clone(), waker.clone());
         let mut app = Self::with_backend(dirs, settings, backend, waker.clone());
+        app.settings_dirty |= settings_changed;
         app.custom_themes.enable_desktop_themes();
         app.load_custom_themes();
         if options.tray {
@@ -335,14 +341,29 @@ impl App {
     /// Creates a disconnected app and event sender for demos and tests.
     pub fn headless(
         mut dirs: AppDirs,
-        settings: Settings,
+        mut settings: Settings,
     ) -> (Self, std::sync::mpsc::Sender<Event>) {
-        dirs.custom_media = settings.custom_media_dir.clone();
+        let settings_changed = Self::restore_media_dir(&mut dirs, &mut settings);
         let (backend, events) = Backend::detached();
-        (
-            Self::with_backend(dirs, settings, backend, Waker::default()),
-            events,
-        )
+        let mut app = Self::with_backend(dirs, settings, backend, Waker::default());
+        app.settings_dirty |= settings_changed;
+        (app, events)
+    }
+
+    fn restore_media_dir(dirs: &mut AppDirs, settings: &mut Settings) -> bool {
+        let custom = settings.custom_media_dir.as_ref().and_then(|path| {
+            match dirs.validate_custom_media_dir(path) {
+                Ok(custom) => custom,
+                Err(_) => {
+                    log::warn!("invalid saved attachment folder; using the default cache");
+                    None
+                }
+            }
+        });
+        let changed = settings.custom_media_dir != custom;
+        settings.custom_media_dir = custom.clone();
+        dirs.custom_media = custom;
+        changed
     }
 
     fn with_backend(dirs: AppDirs, settings: Settings, backend: Backend, waker: Waker) -> Self {
@@ -3844,6 +3865,52 @@ mod name_tests {
             thumbnail: None,
         };
         assert_eq!(app.message_text(&message), "ciao @Carmine");
+    }
+
+    #[test]
+    fn startup_validates_saved_attachment_folders_before_installing_them() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = AppDirs::under(root.path());
+        for path in [
+            dirs.cache.clone(),
+            dirs.cache.join("other"),
+            dirs.state.clone(),
+            dirs.state.join("attachments"),
+            dirs.config.clone(),
+            dirs.config.join("attachments"),
+            root.path().join("missing/../state/attachments"),
+            dirs.media_cache_dir(),
+        ] {
+            let settings = Settings {
+                custom_media_dir: Some(path.clone()),
+                ..Default::default()
+            };
+            let (app, _) = App::headless(dirs.clone(), settings);
+            assert_eq!(app.dirs.custom_media, None, "{path:?}");
+            assert_eq!(app.settings.custom_media_dir, None, "{path:?}");
+            assert_eq!(app.dirs.media_dir(), dirs.media_cache_dir());
+            assert!(app.settings_dirty);
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn startup_retains_and_normalizes_an_unavailable_external_attachment_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let custom = root.path().join("offline/unused/../attachments");
+        let expected = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("offline/attachments");
+        let settings = Settings {
+            custom_media_dir: Some(custom),
+            ..Default::default()
+        };
+        let (app, _) = App::headless(AppDirs::under(root.path()), settings);
+        assert_eq!(app.dirs.custom_media.as_ref(), Some(&expected));
+        assert_eq!(app.settings.custom_media_dir.as_ref(), Some(&expected));
+        assert!(!expected.exists());
     }
 
     #[test]

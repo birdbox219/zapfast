@@ -140,6 +140,36 @@ impl AppDirs {
         Self::is_subpath(path, &self.cache)
     }
 
+    /// Validate without creating folders or requiring external storage to be online.
+    pub fn validate_custom_media_dir(&self, path: &Path) -> std::io::Result<Option<PathBuf>> {
+        let path = resolve_available_parents(path)?;
+        if path == resolve_available_parents(&self.media_cache_dir())? {
+            return Ok(None);
+        }
+        for (boundary, message) in [
+            (
+                &self.cache,
+                "Custom attachment folder cannot be inside the cache directory",
+            ),
+            (
+                &self.state,
+                "Custom attachment folder cannot be inside the app data folders",
+            ),
+            (
+                &self.config,
+                "Custom attachment folder cannot be inside the app data folders",
+            ),
+        ] {
+            if path.starts_with(resolve_available_parents(boundary)?) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    message,
+                ));
+            }
+        }
+        Ok(Some(path))
+    }
+
     /// Checks whether `child` is equal to or located within `parent`.
     pub fn is_subpath(child: &Path, parent: &Path) -> bool {
         match (child.canonicalize(), parent.canonicalize()) {
@@ -188,6 +218,33 @@ impl AppDirs {
         }
         Ok(())
     }
+}
+
+// Resolve existing symlinks before processing '..', but keep unavailable suffixes.
+fn resolve_available_parents(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            _ => {
+                resolved.push(component.as_os_str());
+                if let Ok(canonical) = resolved.canonicalize() {
+                    resolved = canonical;
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 #[cfg(unix)]
@@ -389,6 +446,51 @@ mod tests {
         assert!(!dirs.is_cache_path(&root.join("external-downloads")));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_media_validation_handles_missing_children_and_default_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = AppDirs::under(root.path());
+        dirs.ensure().unwrap();
+        assert_eq!(
+            dirs.validate_custom_media_dir(&dirs.cache.join("unused/../media"))
+                .unwrap(),
+            None
+        );
+        for boundary in [&dirs.cache, &dirs.state, &dirs.config] {
+            assert!(
+                dirs.validate_custom_media_dir(&boundary.join("missing/child"))
+                    .is_err()
+            );
+            assert!(!boundary.join("missing").exists());
+        }
+        assert_eq!(
+            dirs.validate_custom_media_dir(root.path()).unwrap(),
+            Some(root.path().canonicalize().unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_media_validation_resolves_symlinks_before_missing_children_and_parent_steps() {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = AppDirs::under(root.path());
+        dirs.ensure().unwrap();
+        let link = root.path().join("alias");
+        std::os::unix::fs::symlink(&dirs.state, &link).unwrap();
+        assert!(
+            dirs.validate_custom_media_dir(&link.join("missing"))
+                .is_err()
+        );
+        let nested = dirs.state.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let nested_link = root.path().join("nested-alias");
+        std::os::unix::fs::symlink(nested, &nested_link).unwrap();
+        assert!(
+            dirs.validate_custom_media_dir(&nested_link.join("../missing"))
+                .is_err()
+        );
     }
 
     #[test]

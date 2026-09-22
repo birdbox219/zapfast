@@ -10,11 +10,11 @@ use crate::paths::AppDirs;
 /// Only known cache files may be forgotten automatically. An absent external
 /// file may belong to an unmounted drive, even if its mount point is readable.
 pub(super) fn is_disposable_source(dirs: &AppDirs, path: &Path) -> bool {
-    AppDirs::is_subpath(path, &dirs.media_cache_dir())
-        && !dirs
-            .custom_media
-            .as_ref()
-            .is_some_and(|custom| AppDirs::is_subpath(path, custom))
+    let cache = dirs.media_cache_dir();
+    AppDirs::is_subpath(path, &cache)
+        && !dirs.custom_media.as_ref().is_some_and(|custom| {
+            AppDirs::is_subpath(path, custom) && !AppDirs::is_subpath(&cache, custom)
+        })
 }
 
 /// Removes newly published copies on failure, but never touches the source files.
@@ -121,27 +121,19 @@ impl Worker {
                     )
                 })?;
             }
-            let custom = custom.filter(|path| !dirs.is_default_media_dir(path));
+            let custom = custom
+                .as_deref()
+                .map(|path| dirs.validate_custom_media_dir(path))
+                .transpose()?
+                .flatten();
             let dir = custom.clone().unwrap_or_else(|| dirs.media_cache_dir());
             std::fs::create_dir_all(&dir)?;
-            // Resolve symlinks and '..' before checking the cache boundary.
             let dir = dir.canonicalize()?;
-            if custom.is_some() && dirs.is_cache_path(&dir) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Custom attachment folder cannot be inside the cache directory",
-                ));
-            }
-            if custom.is_some()
-                && (AppDirs::is_subpath(&dir, &dirs.state)
-                    || AppDirs::is_subpath(&dir, &dirs.config))
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Custom attachment folder cannot be inside the app data folders",
-                ));
-            }
-            let custom = custom.map(|_| dir.clone());
+            let custom = custom
+                .as_ref()
+                .map(|_| dirs.validate_custom_media_dir(&dir))
+                .transpose()?
+                .flatten();
             // Even an empty archive must not accept an unwritable directory.
             let _probe = tempfile::NamedTempFile::new_in(&dir)?;
             let mut copies = Copies::default();
@@ -634,6 +626,55 @@ mod tests {
         assert!(matches!(
             events.try_recv().unwrap(),
             Event::MediaDirChanged { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ancestor_custom_folder_keeps_missing_cache_files_disposable() {
+        for startup in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (mut worker, events, _commands, _wa) = super::super::receipt_tests::worker();
+            worker.dirs = AppDirs::under(root.path());
+            worker.dirs.custom_media = Some(root.path().to_owned());
+            let missing = worker.dirs.media_cache_dir().join("missing.jpg");
+            let saved = root.path().join("saved.jpg");
+            std::fs::write(&saved, b"preserved").unwrap();
+            attachment(&worker, "missing", &missing);
+            attachment(&worker, "saved", &saved);
+
+            if startup {
+                worker.relocate_media();
+            } else {
+                worker.change_media_dir(None).await;
+                assert!(matches!(
+                    events.try_recv().unwrap(),
+                    Event::MediaDirChanged { .. }
+                ));
+                assert_eq!(worker.dirs.custom_media, None);
+            }
+            assert_eq!(archived_path(&worker, "missing"), None);
+            assert_eq!(
+                std::fs::read(archived_path(&worker, "saved").unwrap()).unwrap(),
+                b"preserved"
+            );
+            assert_eq!(std::fs::read(saved).unwrap(), b"preserved");
+        }
+    }
+
+    #[test]
+    fn disposable_cache_excludes_only_custom_subtrees_inside_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut dirs = AppDirs::under(root.path());
+        let cache = dirs.media_cache_dir();
+        let nested = cache.join("custom");
+        dirs.custom_media = Some(nested.clone());
+        assert!(!is_disposable_source(&dirs, &nested.join("missing.jpg")));
+        assert!(is_disposable_source(&dirs, &cache.join("missing.jpg")));
+        dirs.custom_media = Some(cache.clone());
+        assert!(is_disposable_source(&dirs, &cache.join("missing.jpg")));
+        assert!(!is_disposable_source(
+            &dirs,
+            &root.path().join("external.jpg")
         ));
     }
 
