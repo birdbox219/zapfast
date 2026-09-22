@@ -64,6 +64,8 @@ const THUMBNAIL_SIDE: u32 = 96;
 const STICKER_FETCH_LIMIT: usize = 40;
 const ATTACHMENT_LIMIT_ERROR: &str = "This attachment is larger than the 64 MiB download limit";
 const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(120);
+const ATTACHMENT_STAGING_MARKER: &[u8] = b"ZapFast attachment staging v1\n";
+const ATTACHMENT_STAGING_MARKER_SUFFIX: &str = ".zapfast-staging";
 
 async fn with_attachment_deadline<T>(
     duration: Duration,
@@ -81,6 +83,12 @@ async fn with_attachment_deadline<T>(
 struct LimitedWriter<W> {
     inner: W,
     limit: u64,
+}
+
+/// A download's incomplete file and its companion ownership marker.
+struct AttachmentStaging {
+    path: tempfile::TempPath,
+    _marker: tempfile::TempPath,
 }
 
 impl<W> LimitedWriter<W> {
@@ -165,12 +173,18 @@ async fn download_attachment(
 /// The preferred name can already belong to a user's unrelated file, especially
 /// in a custom folder. `persist_noclobber` keeps that file intact and returns
 /// the distinct name that must be recorded in the archive.
-async fn publish_attachment(temporary: tempfile::TempPath, path: &Path) -> Result<PathBuf, String> {
+async fn publish_attachment(temporary: AttachmentStaging, path: &Path) -> Result<PathBuf, String> {
     let path = path.to_owned();
-    tokio::task::spawn_blocking(move || persist_attachment_noclobber(temporary, &path))
-        .await
-        .map_err(|_| "Attachment publish task failed".to_owned())?
-        .map_err(|error| error.to_string())
+    tokio::task::spawn_blocking(move || {
+        let AttachmentStaging {
+            path: staged,
+            _marker,
+        } = temporary;
+        persist_attachment_noclobber(staged, &path)
+    })
+    .await
+    .map_err(|_| "Attachment publish task failed".to_owned())?
+    .map_err(|error| error.to_string())
 }
 
 fn persist_attachment_noclobber(
@@ -204,23 +218,20 @@ fn temporary_attachment_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{:016x}.part", rand::random::<u64>()))
 }
 
+fn attachment_staging_marker_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("media.part");
+    path.with_file_name(format!("{name}{ATTACHMENT_STAGING_MARKER_SUFFIX}"))
+}
+
 /// Creates an exclusive, self-cleaning staging file next to the destination.
-fn temporary_attachment_file(path: &Path) -> Result<(tempfile::TempPath, std::fs::File), String> {
+fn temporary_attachment_file(path: &Path) -> Result<(AttachmentStaging, std::fs::File), String> {
     for _ in 0..8 {
         let temporary = temporary_attachment_path(path);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => match tempfile::TempPath::try_from_path(&temporary) {
-                Ok(temporary) => return Ok((temporary, file)),
-                Err(error) => {
-                    drop(file);
-                    let _ = std::fs::remove_file(&temporary);
-                    return Err(error.to_string());
-                }
-            },
+        match create_attachment_staging(&temporary) {
+            Ok(staged) => return Ok(staged),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.to_string()),
         }
@@ -228,8 +239,57 @@ fn temporary_attachment_file(path: &Path) -> Result<(tempfile::TempPath, std::fs
     Err("Could not create a unique attachment staging file".to_owned())
 }
 
+fn create_attachment_staging(path: &Path) -> io::Result<(AttachmentStaging, std::fs::File)> {
+    // Establish ownership before writing a marker. A crash before the marker is
+    // complete leaves an unmarked file, which custom-folder cleanup preserves.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let temporary = match tempfile::TempPath::try_from_path(path) {
+        Ok(path) => path,
+        Err(error) => {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+    };
+    let marker_path = attachment_staging_marker_path(path);
+    let marker = (|| {
+        let mut marker_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)?;
+        let result = marker_file
+            .write_all(ATTACHMENT_STAGING_MARKER)
+            .and_then(|()| marker_file.sync_all());
+        drop(marker_file);
+        match result.and_then(|()| tempfile::TempPath::try_from_path(&marker_path)) {
+            Ok(marker) => Ok(marker),
+            Err(error) => {
+                let _ = std::fs::remove_file(&marker_path);
+                Err(error)
+            }
+        }
+    })();
+    match marker {
+        Ok(marker) => Ok((
+            AttachmentStaging {
+                path: temporary,
+                _marker: marker,
+            },
+            file,
+        )),
+        Err(error) => {
+            // Close the file before its TempPath removes it, including on Windows.
+            drop(file);
+            Err(error)
+        }
+    }
+}
+
 /// Removes incomplete, unreferenced downloads left by an interrupted process.
-fn discard_attachment_staging(dir: &Path) {
+fn discard_attachment_staging(dir: &Path, require_marker: bool) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return,
@@ -241,17 +301,26 @@ fn discard_attachment_staging(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if is_attachment_staging_name(&name)
-            && entry.path().is_file()
-            && let Err(_) = std::fs::remove_file(entry.path())
+        let path = entry.path();
+        if !is_attachment_staging_name(&name)
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || (require_marker && !has_attachment_staging_marker(&path))
         {
-            log::warn!("could not remove incomplete attachment");
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                let marker = attachment_staging_marker_path(&path);
+                // Legacy cache staging files may not have a marker.
+                let _ = std::fs::remove_file(marker);
+            }
+            Err(_) => log::warn!("could not remove incomplete attachment"),
         }
     }
 }
 
-/// Only remove paths with the exact randomized format produced above. A custom
-/// folder can contain the user's own hidden partial files, which are not ours.
+/// Identifies the generated staging filename, which still needs an ownership
+/// marker before cleanup in a user-controlled custom folder.
 fn is_attachment_staging_name(name: &str) -> bool {
     let Some(stem) = name
         .strip_prefix('.')
@@ -263,6 +332,12 @@ fn is_attachment_staging_name(name: &str) -> bool {
         return false;
     };
     random.len() == 16 && random.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn has_attachment_staging_marker(path: &Path) -> bool {
+    let marker = attachment_staging_marker_path(path);
+    std::fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.file_type().is_file())
+        && std::fs::read(marker).is_ok_and(|contents| contents == ATTACHMENT_STAGING_MARKER)
 }
 
 fn account_allows_receipts(
@@ -434,11 +509,11 @@ pub async fn run(
     worker.load_state();
     worker.backfill();
     worker.relocate_media();
-    discard_attachment_staging(&worker.dirs.media_cache_dir());
+    discard_attachment_staging(&worker.dirs.media_cache_dir(), false);
     if worker.dirs.custom_media.is_some() {
-        discard_attachment_staging(&worker.dirs.media_dir());
+        discard_attachment_staging(&worker.dirs.media_dir(), true);
     }
-    discard_attachment_staging(&worker.dirs.sticker_cache_dir());
+    discard_attachment_staging(&worker.dirs.sticker_cache_dir(), false);
     worker.start_bot().await;
     let mut wa_events = wa_events;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -6280,23 +6355,29 @@ mod tests {
         let destination = directory.join("photo.jpg");
         let (first_path, first) = temporary_attachment_file(&destination).expect("first file");
         let (second_path, second) = temporary_attachment_file(&destination).expect("second file");
-        assert_ne!(first_path.as_ref() as &Path, second_path.as_ref() as &Path);
+        assert_ne!(
+            first_path.path.as_ref() as &Path,
+            second_path.path.as_ref() as &Path
+        );
         assert!(
             first_path
+                .path
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .starts_with('.')
         );
         assert!(is_attachment_staging_name(
-            &first_path.file_name().unwrap().to_string_lossy()
+            &first_path.path.file_name().unwrap().to_string_lossy()
         ));
         assert!(!destination.exists());
         drop((first, second));
         std::fs::write(&destination, b"complete attachment").expect("writes completed file");
-        discard_attachment_staging(&directory);
-        assert!(!first_path.exists());
-        assert!(!second_path.exists());
+        discard_attachment_staging(&directory, true);
+        assert!(!first_path.path.exists());
+        assert!(!second_path.path.exists());
+        assert!(!first_path._marker.exists());
+        assert!(!second_path._marker.exists());
         assert_eq!(
             std::fs::read(&destination).expect("reads completed file"),
             b"complete attachment"
@@ -6307,10 +6388,129 @@ mod tests {
     #[test]
     fn staging_cleanup_leaves_unrelated_hidden_partial_files() {
         let directory = tempfile::tempdir().expect("creates staging directory");
-        let unrelated = directory.path().join(".editor-recovery.part");
-        std::fs::write(&unrelated, b"user file").expect("writes unrelated file");
-        discard_attachment_staging(directory.path());
-        assert_eq!(std::fs::read(unrelated).unwrap(), b"user file");
+        for name in [".editor-recovery.part", ".photo.jpg.0123456789abcdef.part"] {
+            let unrelated = directory.path().join(name);
+            std::fs::write(&unrelated, b"user file").expect("writes unrelated file");
+            discard_attachment_staging(directory.path(), true);
+            assert_eq!(std::fs::read(&unrelated).unwrap(), b"user file");
+        }
+    }
+
+    #[test]
+    fn staging_cleanup_preserves_invalid_markers_and_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        for (index, contents) in [
+            b"".as_slice(),
+            b"ZapFast attachment staging",
+            b"user marker",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = directory.path().join(format!(".photo.{index:016x}.part"));
+            let marker = attachment_staging_marker_path(&path);
+            std::fs::write(&path, b"user file").unwrap();
+            std::fs::write(&marker, contents).unwrap();
+            discard_attachment_staging(directory.path(), true);
+            assert_eq!(std::fs::read(&path).unwrap(), b"user file");
+            assert_eq!(std::fs::read(&marker).unwrap(), contents);
+        }
+        let path = directory.path().join(".directory.0123456789abcdef.part");
+        std::fs::create_dir(&path).unwrap();
+        let marker = attachment_staging_marker_path(&path);
+        std::fs::write(&marker, ATTACHMENT_STAGING_MARKER).unwrap();
+        discard_attachment_staging(directory.path(), true);
+        assert!(path.is_dir());
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn staging_collisions_never_mark_or_modify_existing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".photo.0123456789abcdef.part");
+        let marker = attachment_staging_marker_path(&path);
+        std::fs::write(&path, b"user file").unwrap();
+        assert!(matches!(
+            create_attachment_staging(&path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(!marker.exists());
+        discard_attachment_staging(directory.path(), true);
+        assert_eq!(std::fs::read(&path).unwrap(), b"user file");
+
+        // An existing marker must also survive, and the newly created staging
+        // file must be rolled back when its marker cannot be created exclusively.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&marker, b"user marker").unwrap();
+        assert!(matches!(
+            create_attachment_staging(&path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(marker).unwrap(), b"user marker");
+    }
+
+    #[test]
+    fn staging_cleanup_removes_marked_crash_remnants_and_legacy_cache_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let (staged, file) =
+            temporary_attachment_file(&directory.path().join("photo.jpg")).unwrap();
+        drop(file);
+        // Keep both paths to simulate abrupt process exit without RAII cleanup.
+        let path = staged.path.keep().unwrap();
+        let marker = staged._marker.keep().unwrap();
+        let legacy = directory.path().join(".legacy.0123456789abcdef.part");
+        std::fs::write(&legacy, b"unmarked partial").unwrap();
+        discard_attachment_staging(directory.path(), true);
+        assert!(!path.exists());
+        assert!(!marker.exists());
+        assert!(legacy.exists());
+        discard_attachment_staging(directory.path(), false);
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn dropping_attachment_staging_removes_both_owned_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let (staged, file) =
+            temporary_attachment_file(&directory.path().join("photo.jpg")).unwrap();
+        let path = staged.path.to_path_buf();
+        let marker = staged._marker.to_path_buf();
+        assert!(has_attachment_staging_marker(&path));
+        drop(file);
+        drop(staged);
+        assert!(!path.exists());
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_cleanup_preserves_symlinks_and_their_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("user-file");
+        std::fs::write(&target, b"user file").unwrap();
+        let path = directory.path().join(".photo.0123456789abcdef.part");
+        let marker = attachment_staging_marker_path(&path);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        std::fs::write(&marker, ATTACHMENT_STAGING_MARKER).unwrap();
+        discard_attachment_staging(directory.path(), true);
+        assert!(path.is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"user file");
+        assert!(marker.exists());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::write(&path, b"user partial").unwrap();
+        let marker_target = directory.path().join("user-marker");
+        std::fs::write(&marker_target, ATTACHMENT_STAGING_MARKER).unwrap();
+        std::os::unix::fs::symlink(&marker_target, &marker).unwrap();
+        discard_attachment_staging(directory.path(), true);
+        assert_eq!(std::fs::read(&path).unwrap(), b"user partial");
+        assert!(marker.is_symlink());
+        assert_eq!(
+            std::fs::read(marker_target).unwrap(),
+            ATTACHMENT_STAGING_MARKER
+        );
     }
 
     #[tokio::test]
@@ -6323,12 +6523,16 @@ mod tests {
             .expect("writes staged attachment");
         drop(file);
 
+        let marker = temporary._marker.to_path_buf();
+        let staging_path = temporary.path.to_path_buf();
         let published = publish_attachment(temporary, &destination)
             .await
             .expect("publishes without clobbering");
         assert_ne!(published, destination);
         assert_eq!(std::fs::read(&destination).unwrap(), b"unrelated");
         assert_eq!(std::fs::read(&published).unwrap(), b"downloaded attachment");
+        assert!(!staging_path.exists());
+        assert!(!marker.exists());
     }
 
     #[test]

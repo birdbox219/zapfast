@@ -212,6 +212,9 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   there). Saved folder settings are checked at startup too: paths inside those
   app folders fall back to the default cache, and selecting the default cache is
   treated as **Reset**. An unavailable external folder remains configured.
+  Startup cleanup in a custom folder removes incomplete downloads only when they
+  have a valid ZapFast ownership marker. Unmarked partial files, including those
+  left by older versions, are preserved.
   Unlinking removes this device and clears cache files while preserving
   custom folders and the attachments copied there.
 
