@@ -215,6 +215,8 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   Startup cleanup in a custom folder removes incomplete downloads only when they
   have a valid ZapFast ownership marker. Unmarked partial files, including those
   left by older versions, are preserved.
+  Folder changes reject special files (such as named pipes) in place of saved
+  attachments, keeping the previous folder and archived paths intact.
   Unlinking removes this device and clears cache files while preserving
   custom folders and the attachments copied there.
 

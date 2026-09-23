@@ -37,10 +37,7 @@ impl Copies {
     fn copy(&mut self, source: &Path, dir: &Path) -> std::io::Result<PathBuf> {
         let name = source.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
         // Validate even when the source is already in the destination folder.
-        let mut input = std::fs::File::open(source)?;
-        if !input.metadata()?.is_file() {
-            return Err(std::io::ErrorKind::InvalidInput.into());
-        }
+        let mut input = open_regular_source(source)?;
         if source
             .parent()
             .and_then(|parent| parent.canonicalize().ok())
@@ -55,6 +52,41 @@ impl Copies {
         self.0.push(path.clone());
         Ok(path)
     }
+}
+
+/// Open without waiting for a FIFO writer, then validate the opened object before
+/// reading. A path-only metadata check would race with replacement of the source.
+fn open_regular_source(source: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let input = {
+        use rustix::fs::{Mode, OFlags, open};
+
+        std::fs::File::from(open(
+            source,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY,
+            Mode::empty(),
+        )?)
+    };
+    #[cfg(not(unix))]
+    let input = std::fs::File::open(source)?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, GetFileType};
+
+        // Windows CreateFile connects to an available pipe or returns an error;
+        // it does not wait for a server. Reject pipes and devices before any read
+        // or metadata query on the handle. Never call WaitNamedPipe here.
+        // SAFETY: input owns a valid handle throughout this call.
+        if unsafe { GetFileType(input.as_raw_handle()) } != FILE_TYPE_DISK {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+    }
+    if !input.metadata()?.is_file() {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    Ok(input)
 }
 
 fn publish(mut staged: tempfile::NamedTempFile, preferred: &Path) -> std::io::Result<PathBuf> {
@@ -320,6 +352,148 @@ mod tests {
         assert_eq!(std::fs::read_dir(custom).unwrap().count(), 0);
         assert!(matches!(events.try_recv().unwrap(), Event::Error(_)));
         assert!(events.try_recv().is_err());
+    }
+
+    /// Run the special-file cases in a child so a regression in open() cannot
+    /// hang the test suite (including Tokio's wait for blocking tasks on drop).
+    #[test]
+    fn special_sources_are_rejected_without_waiting() {
+        const CHILD: &str = "ZAPFAST_TEST_SPECIAL_MEDIA_SOURCES";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "backend::worker::media_storage::tests::special_sources_are_rejected_without_waiting",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "special-file child failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("opening a special attachment source blocked");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        assert!(open_regular_source(root.path()).is_err());
+        #[cfg(unix)]
+        {
+            let fifo = root.path().join("pipe.jpg");
+            rustix::fs::mkfifo(&fifo, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).unwrap();
+            let alias = root.path().join("alias.jpg");
+            std::os::unix::fs::symlink(&fifo, &alias).unwrap();
+            for source in [&fifo, &alias] {
+                assert_special_source_rejected(source);
+                assert!(source.symlink_metadata().is_ok());
+            }
+            // Character devices must never be treated as attachment contents.
+            assert_special_source_rejected(Path::new("/dev/null"));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_OUTBOUND;
+            use windows_sys::Win32::System::Pipes::{
+                CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+            };
+
+            let pipe = PathBuf::from(format!(
+                r"\\.\pipe\zapfast-media-test-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let name: Vec<u16> = pipe.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: name is NUL-terminated and the security pointer is null.
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_OUTBOUND,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1,
+                    1024,
+                    1024,
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(handle, INVALID_HANDLE_VALUE);
+            // SAFETY: CreateNamedPipeW returned a new valid, uniquely owned handle.
+            let _server = unsafe { std::fs::File::from_raw_handle(handle) };
+            // The server sends no data. A read from this pipe would block.
+            assert_special_source_rejected(&pipe);
+            assert_special_source_rejected(Path::new(r"\\.\NUL"));
+        }
+    }
+
+    fn assert_special_source_rejected(source: &Path) {
+        assert_eq!(
+            open_regular_source(source).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        // Validation is also required for the same-directory fast path.
+        if let Some(parent) = source.parent() {
+            assert!(Copies::default().copy(source, parent).is_err());
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (mut worker, events, _commands, _wa) = super::super::receipt_tests::worker();
+            worker.dirs = AppDirs::under(root.path());
+            let custom = root.path().join("custom");
+            std::fs::create_dir(&custom).unwrap();
+            worker.dirs.custom_media = Some(custom.clone());
+            let valid = custom.join("normal.jpg");
+            std::fs::write(&valid, b"fixture").unwrap();
+            attachment(&worker, "normal", &valid);
+            attachment(&worker, "special", source);
+            let target = root.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            let unrelated = target.join("user-file");
+            std::fs::write(&unrelated, b"preserved").unwrap();
+
+            worker.change_media_dir(Some(target.clone())).await;
+            assert_eq!(worker.dirs.custom_media, Some(custom));
+            assert_eq!(archived_path(&worker, "normal"), Some(valid.clone()));
+            assert_eq!(archived_path(&worker, "special"), Some(source.to_owned()));
+            assert_eq!(std::fs::read(valid).unwrap(), b"fixture");
+            assert_eq!(std::fs::read(unrelated).unwrap(), b"preserved");
+            assert_eq!(std::fs::read_dir(target).unwrap().count(), 1);
+            assert!(matches!(events.try_recv().unwrap(), Event::Error(_)));
+            assert!(events.try_recv().is_err());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_source_symlinks_still_copy_the_attachment() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("photo.jpg");
+        std::fs::write(&source, b"fixture").unwrap();
+        let alias = root.path().join("alias.jpg");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let mut copies = Copies::default();
+        let copied = copies.copy(&alias, &target).unwrap();
+        assert_eq!(std::fs::read(copied).unwrap(), b"fixture");
+        assert!(alias.is_symlink());
+        assert_eq!(std::fs::read(source).unwrap(), b"fixture");
     }
 
     #[tokio::test]
